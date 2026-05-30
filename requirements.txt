@@ -1,7 +1,0 @@
-# ZeroMQ-based TCP Tunnel
-# Install with: pip install -r requirements.txt
-# Or use system packages: apt install python3-pyzmq libsodium-dev libzmq3-dev
-
-pyzmq>=25.0
-aiofiles>=23.0
-numpy>=1.24
