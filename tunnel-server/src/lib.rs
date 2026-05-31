@@ -1,4 +1,4 @@
-//! Tunnel Server - Phase 2 Implementation
+// Tunnel Server - Phase 3 Resilience Implementation
 
-// Server entry point
-pub fn run(_port: u16) {} mod registrar {} pub mod stream_mux; pub mod session_tracker;
+mod stream_mux;
+mod session_tracker;
