@@ -1,8 +1,18 @@
 [workspace]
-resolver = "2"
-members = ["tunnel-common", "tunnel-server", "tunnel-agent"]
+members = ["tunnel-server", "tunnel-agent", "tunnel-common"]
 
 [profile.release]
 opt-level = 3
 lto = true
-strip = true
+panic = "unwind"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+serde = "1"
+serde_json = "1"
+rmp-serde = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+opentelemetry = "0.22"
