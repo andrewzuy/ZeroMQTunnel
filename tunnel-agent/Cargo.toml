@@ -4,12 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-zmq.workspace = true
+clap.workspace = true
 tokio.workspace = true
-tunnel-common.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
-clap.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-anyhow.workspace = true
+anyhow = "1.0"

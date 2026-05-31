@@ -1,5 +1,15 @@
-// Phase 3 Forwarding
-#[derive(Parser)] pub struct Args { #[arg(long)] remote: bool, #[arg(short = "R", default_value = "")] service_id: String, #[arg(value_name = "PORT")] port: u16, }
-pub struct RemoteForwarder { pub port: u16, pub service_id: String, }
+use clap::Parser;
 
-pub struct LocalForwarder { pub local_port: u16, }
+#[derive(Parser)]
+pub struct Args {
+    #[arg(long)] remote: bool,
+    #[arg(short = "R")] service_id: String,
+    #[arg(name = "port", value_name = "PORT")] port: u16,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    println!("ZeroMQ Tunnel Agent");
+    Ok(())
+}
