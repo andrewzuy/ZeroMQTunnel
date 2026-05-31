@@ -2,3 +2,5 @@
 
 mod stream_mux;
 mod session_tracker;
+//! Phase 4 Observability Integration
+mod monitoring;
