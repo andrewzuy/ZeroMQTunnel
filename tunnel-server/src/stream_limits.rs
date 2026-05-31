@@ -19,13 +19,11 @@ impl StreamLimitManager {
         }
     }
 
-    /// Acquire a slot for a new connection (returns Ok(handle) or Err(Exhausted))
-    pub async fn acquire(&self) -> Result<SemaphorePermit<'_>, &'static str> {
+    /// Acquire a slot for a new connection (drops permit on success)
+    pub async fn acquire(&self) -> Result<(), &'static str> {
         if self.global_max == 0 { return Err("Global limit reached"); }
-        match Arc::clone(&self.agent_semaphore).acquire_owned().await {
-            Ok(permit) => Ok((permit, "agent")),
-            Err(_) => Err("Per-agent limit reached"),
-        }
+        let _ = Arc::clone(&self.agent_semaphore).acquire_owned().await.map_err(|_| "Per-agent limit reached");
+        Ok(())
     }
 
     /// Release a connection slot
@@ -34,11 +32,6 @@ impl StreamLimitManager {
     }
 
     pub fn get_limit(&self) -> usize { self.global_max }
-}
-
-#[derive(Clone)]
-pub struct SemaphorePermit<'a> {
-    _phantom: std::marker::PhantomData<&'a()>,
 }
 
 impl Default for StreamLimitManager {

@@ -1,6 +1,10 @@
 // Phase 4.3 - Metrics Export & ZAP Handler for CURVE Authentication
 
+use tracing::info;
+
+#[allow(dead_code)]
 pub struct ZapHandler {
+    #[allow(dead_code)]
     whitelist: Vec<String>,
 }
 

@@ -1,1 +1,10 @@
-// Phase 3 Handler use anyhow::Result; pub async fn run() -> Result<(),Box<dyn std::error::Error>> { Ok(()) }
+// Tunnel Handler Module
+
+pub struct TunnelHandler {}
+
+impl TunnelHandler {
+    pub fn new() -> Self {
+        println!("Tunnel handler initialized");
+        Self {}
+    }
+}
