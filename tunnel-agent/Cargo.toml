@@ -1,7 +1,7 @@
 [package]
 name = "tunnel-agent"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 clap.workspace = true
@@ -10,4 +10,10 @@ rmp-serde.workspace = true
 serde.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-anyhow = "1.0"
+anyhow.workspace = true
+zmq = { version = "0.10", default-features = false }
+tunnel-common = { path = "../tunnel-common" }
+toml = "0.8"
+
+[dev-dependencies]
+rand = "0.8"

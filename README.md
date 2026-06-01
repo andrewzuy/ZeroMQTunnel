@@ -1,114 +1,98 @@
-# ZeroMQTunnel - Resilient Encrypted TCP Tunnels
+# ZeroMQTunnel - Resilient Encrypted TCP Tunnels (WIP)
 
-[![Phase 4](https://img.shields.io/badge/Phase-4-green)](https://raw.githubusercontent.com/zeroqmq-tunnel)
+[![Phase 4](https://img.shields.io/badge/Phase-4-orange)](https://raw.githubusercontent.com/zeroqmq-tunnel)
 
-## 🚀 Features
+## 🚀 Status
 
-- **Remote Forwarding** - Expose local services on other NATed hosts via a public port
-- **Local Forwarding** - Access remote services through local port listeners
-- **End-to-end encryption** with ZeroMQ CURVE authentication
-- **Automatic reconnection** on network disruptions
-- **Production hardening** with metrics, tracing, and resource limits
+**In Development** - Core architecture implemented, CLI requires additional functionality.
 
-## 📥 Quick Start
+Current capabilities:
+- Basic CLI argument parsing (server takes config file, agent has remote/local modes)
+- Project structure for ZeroMQ CURVE tunnel system
+- Modules prepared for: config loading, ZAP handler, stream limits, session tracking
 
-### Prerequisites
-
-1. Generate CURVE keypairs:
+## 📦 Build
 
 ```bash
-# Server key (public-facing)
-cargo run --bin tunnel-server -- genkey --output /etc/tunnel/server.pem
+# Debug build
+cargo build --workspace
 
-# Agent keys for each host
-cargo run --bin tunnel-agent -- genkey --output ~/.config/tunnel/agent-a.pem
-cargo run --bin tunnel-agent -- genkey --output ~/.config/tunnel/agent-c.pem
+# Release build  
+cargo build --workspace --release
 ```
 
-### 2. Configure Tunnel Server
+Binaries will be in `target/debug/` and `target/release/`.
 
-Create `/etc/tunnel/server.toml`:
-
-```toml
-[server]
-control_port = 5555
-listen_address = "0.0.0.0:1443"
-key_file = "/etc/tunnel/server.pem"
-global_max_connections = 1000
-```
-
-### 3. Start Server
-
-```bash
-cargo run --release --bin tunnel-server \
-    --config /etc/tunnel/server.toml
-```
-
-### 4. Remote Forwarding (Expose local port)
-
-On host C running your local service:
-
-```bash
-cargo run --release --bin tunnel-agent \
-    --remote -s web-443 443 \
-    --server-address http://server:5555 \
-    --key-file ~/.config/tunnel/agent-c.pem
-```
-
-**Access:** Connect to `http://<server-ip>:1443` from anywhere!
-
-### 5. Local Forwarding (Access remote service locally)
-
-Server-side (host C):
-```bash
-cargo run --release --bin tunnel-agent \
-    --remote -s web-443 443 \
-    --server-address http://server:5555 \
-    --key-file ~/.config/tunnel/agent-c.pem
-```
-
-Client-side (host A):
-```bash
-cargo run --release --bin tunnel-agent \
-    --remote -s web-443 443 \
-    --server-address http://server:5555 \
-    --key-file ~/.config/tunnel/agent-a.pem
-```
-
-**Access:** Connect to `http://localhost:8080` on host A!
-
-## 🔧 CLI Options
+## 🔬 Development Commands
 
 ### Tunnel Server
+The server expects a TOML configuration file as its only argument:
 
 ```bash
-cargo run --release --bin tunnel-server [OPTIONS]
+# Run server with config file
+cargo run --bin tunnel-server /etc/tunnel/server.toml
 
-Arguments:
-  <CONFIG>              Path to configuration file (TOML format)
+# Or use relative path
+cargo run --bin tunnel-server ./config/server.toml
+```
 
-Options:
-  -h, --help            Print help
+**Current stub implementation:**
+```rust
+// tunnel-server/src/main.rs
+#[derive(Parser)]
+pub struct Args { config: PathBuf }
 ```
 
 ### Tunnel Agent
+The agent requires a service-id and port as positional arguments:
 
 ```bash
-cargo run --release --bin tunnel-agent [OPTIONS]
+# Remote forwarding mode
+cargo run --bin tunnel-agent --remote -s web-443 443
 
-Arguments:
-  <PORT>                Local service port to forward
-  -s <service-id>       Human-readable service identifier (e.g. web-443)
+# Local forwarding mode  
+cargo run --bin tunnel-agent --local -s internal-api 8080
+```
 
-Options:
-  --remote              Enable remote forwarding mode (tunnel server mode)
-  --local               Enable local forwarding mode (local proxy mode)
-  --server-address      Control server address (required, e.g. zmq://server:5555)
-  --key-file <PATH>     Path to agent's CURVE keypair
-  -h, --help            Print help
+**Current stub implementation:**
+```rust
+// tunnel-agent/src/main.rs
+#[derive(Parser)]
+pub struct Args {
+    #[arg(long)] remote: bool,
+    #[arg(short, name = "service-id")] service_id: String,
+    #[arg(name = "port", value_name = "PORT")] port: u16,
+}
 ```
 
 ## 🏗️ Architecture
+
+The project uses a Rust workspace with the following structure:
+
+```
+ZeroMQTunnel/
+├── tunnel-server/     # Central relay server (public-facing)
+│   └── src/
+│       ├── main.rs    # CLI entry point (config file argument)
+│       ├── lib.rs     # Public API
+│       ├── config.rs  # Server configuration
+│       ├── registrar/ # Agent registration & heartbeat
+│       ├── handler/   # Tunnel stream handling
+│       ├── monitoring # Metrics & tracing
+│       └── stream_limits/ # Connection resource limits
+├── tunnel-agent/      # Client agents (deployed at endpoints)
+│   └── src/
+│       └── main.rs    # CLI entry point (remote/local mode)
+└── tunnel-common/     # Shared types and utilities
+    └── src/
+        ├── lib.rs     # Public API
+        ├── types/     # Core message types
+        ├── messages/  # Protocol messages
+        ├── registrar/ # Registrar client types
+        └── registry/  # Service registry types
+```
+
+### Control Flow
 
 ```
 ┌───────────────┐     ┌───────────────────┐     ┌───────────────┐
@@ -117,42 +101,64 @@ Options:
 │ web-443       │     │                   │     │ localhost:8080 │
 └───────────────┘     └───────────────────┘     └───────────────┘
 
-All control connections use CURVE encrypted ZeroMQ
+All control connections use ZeroMQ (CURVE encryption TBD)
 ```
 
-## 🔐 Security
+## 🔐 Security Design
 
-- **CURVE Encryption**: All control channel connections use authenticated Curve25519
-- **Agent Whitelist**: Only approved agents can connect to the tunnel server (ZAP-based)
-- **Key Storage**: Keys stored in PEM format, age-encrypted at rest
+Planned security features (implementation pending):
 
-**Note:** Public-facing ports for remote forwards are plain TCP. Applications can add TLS inside the tunnel if needed.
+- **CURVE Encryption**: All control channel connections using Curve25519
+- **Agent Whitelisting**: ZAP-based authentication for agent registry
+- **Key Storage**: PEM format keys, age-encrypted at rest when deployed
 
-## 🧪 Testing Your Setup
+**Note:** Public-facing proxy ports will be plain TCP. TLS can be added within the tunnel if needed.
 
-```bash
-# Test agent connection
-./target/release/tunnel-agent --remote -s test 8000 \
-    --server-address zmq://localhost:5555 \
-    --key-file ~/.config/tunnel/agent-dev.pem
-```
-
-## 🔬 Development
+## 🧪 Testing
 
 ```bash
-# Build workspace
+# Build
 cargo build --workspace --release
 
-# Run server (testing without config)
-cd tunnel-server && cargo run --bin tunnel-server
+# Start server (requires config file path)
+./target/release/tunnel-server ./config/server.toml
 
-# Run agent on same machine to test
-cd ../tunnel-agent && cargo run --bin tunnel-agent \
-    --remote -s local-test 8000 \
-    --server-address zmq://localhost:5555 \
-    --key-file ~/.config/tunnel/agent-dev.pem
+# Test agent connection
+./target/release/tunnel-agent --remote -s test 8000
+```
+
+## 🧩 Modules (Work in Progress)
+
+| Module | Status | Description |
+|--------|--------|-------------|
+| `registrar` | Stub | Agent registration & heartbeat mechanism |
+| `handler` | Stub | Tunnel stream handling logic |
+| `session_tracker` | Not created | Session lifecycle tracking |
+| `stream_limits` | Stub | Connection resource limits |
+| `monitoring` | Implemented | Metrics export, ZAP handler base |
+| `config` | Implemented | Server configuration loading |
+
+## 🔧 Current TODOs
+
+1. **Server:** Implement config parsing, ZeroMQ context binding, control port listener
+2. **Agent:** Implement ZeroMQ connection, CURVE keypair handling, remote/local mode logic  
+3. **Common:** Implement shared message types, service registry protocol
+4. **Security:** Add CURVE ZAP authentication, agent whitelist validation
+5. **CLI:** Add `genkey` subcommand for key generation
+
+## 📦 Dependencies
+
+```toml
+tokio         # Async runtime
+tracing       # Structured logging
+serde         # Serialization  
+clap          # CLI parsing
+anyhow        # Error handling
+zmq           # ZeroMQ bindings (v0.10)
+uuid          # Service IDs (with serde support)
+rmp-serde     # Message serialization for agent communication
 ```
 
 ---
 
-**Built with Tokio & ZeroMQ for production-ready, self-healing encrypted tunnels.**
+**ZeroMQTunnel - Building production-ready, self-healing encrypted tunnels.**

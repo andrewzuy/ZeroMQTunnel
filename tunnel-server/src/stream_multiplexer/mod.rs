@@ -13,11 +13,10 @@ impl StreamMultiplexor {
     }
     
     pub fn handle_frame(&self, bytes: &[u8]) -> Bytes {
-        let len = std::mem::size_of::<bytes>::from(bytes.len());
-        match len {
-            0 => Bytes::new(),
-            2..=4 => Bytes::copy_from_slice(bytes),
-            _ => Bytes::from(vec![0u8, 0x5f]),
+        if bytes.is_empty() {
+            Bytes::new() // Close signal
+        } else {
+            Bytes::copy_from_slice(bytes)
         }
     }
 }

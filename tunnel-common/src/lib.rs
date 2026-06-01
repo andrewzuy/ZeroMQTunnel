@@ -1,10 +1,17 @@
-// Tunnel Common Library
-use serde;
-pub struct Registry {}
-pub trait Service {
-    fn name(&self) -> String;
-}
-pub struct ServiceId(String);
-impl From<String> for ServiceId {
-    fn from(s: String) -> Self { ServiceId(s) }
-}
+//! ZeroMQ Tunnel Common Library
+//!
+//! Shared types and utilities used by both server and agent.
+
+pub mod messages;
+pub mod registrar;
+pub mod registry;
+pub mod utils;
+pub mod types;
+
+pub use messages::{ControlMessage, RegistrationResponse};
+pub use registrar::AgentRegistrar;
+pub use registry::ServiceRegistry;
+pub use types::{
+    ForwardMode, RegistrationRequest, RegistrationResponse as RegResponse, SessionState,
+    StreamId, TunnelError, AgentIdentity,
+};
