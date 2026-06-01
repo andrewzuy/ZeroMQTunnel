@@ -13,5 +13,8 @@ pub use registrar::AgentRegistrar;
 pub use registry::ServiceRegistry;
 pub use types::{
     ForwardMode, RegistrationRequest, RegistrationResponse as RegResponse, SessionState,
-    StreamId, TunnelError, AgentIdentity,
+    StreamId, TunnelError, AgentIdentity, Heartbeat, StreamStartRequest, StreamCloseRequest,
 };
+
+// Re-export rmp-serde serialization functions for convenience
+pub use rmp_serde::to_vec;

@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// Configuration for the tunnel server
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Control port for ZMQ ROUTER socket
     pub control_port: u16,

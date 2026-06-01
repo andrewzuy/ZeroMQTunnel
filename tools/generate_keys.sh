@@ -1,62 +1,59 @@
 #!/bin/bash
 # ZeroMQ Tunnel Key Generation Script
-# Generates CURVE keypairs for server and agent
-# Keys are stored in the tools/ directory by default
+# Generates REAL Ed25519 CURVE keypairs using OpenSSL
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "=== ZeroMQ Tunnel Key Generator ==="
+echo "Using OpenSSL to generate real Ed25519 CURVE keypairs"
 echo ""
 
-# Use tools/ as default directory (relative to script location)
-# User can override with SERVER_KEY_DIR and AGENT_KEY_DIR environment variables
+# Default directories (keys are stored next to this script)
 SERVER_KEY_DIR="${SERVER_KEY_DIR:-${SCRIPT_DIR}/../tunnel-server/config}"
 AGENT_KEY_DIR="${AGENT_KEY_DIR:-${SCRIPT_DIR}/../tunnel-agent/config}"
 
 mkdir -p "$SERVER_KEY_DIR" 2>/dev/null || true
 mkdir -p "$AGENT_KEY_DIR" 2>/dev/null || true
 
-# Check if already generated
-if [ -f "${SERVER_KEY_DIR}/server.pem" ]; then
+# Check if already generated (real Ed25519 keys)
+if [ -f "${SERVER_KEY_DIR}/server.pem" ] && grep -q "BEGIN PRIVATE KEY" "${SERVER_KEY_DIR}/server.pem" 2>/dev/null; then
     echo "Server key already exists at ${SERVER_KEY_DIR}/server.pem"
 fi
 
-if [ -f "${AGENT_KEY_DIR}/agent.pem" ]; then
+if [ -f "${AGENT_KEY_DIR}/agent.pem" ] && grep -q "BEGIN PRIVATE KEY" "${AGENT_KEY_DIR}/agent.pem" 2>/dev/null; then
     echo "Agent key already exists at ${AGENT_KEY_DIR}/agent.pem"
 fi
 
-# Generate server key if not exists
+# Generate server key if not exists (or placeholder)
 if [ ! -f "${SERVER_KEY_DIR}/server.pem" ]; then
     echo ""
-    echo "Generating server CURVE keypair..."
-
-    # Generate 64 hex characters (32 bytes for x25519 private key)
-    local_hex_key=$(head -c 32 /dev/urandom | od -An -t x1 | tr -d ' \n')
-
-    cat > "${SERVER_KEY_DIR}/server.pem" << EOF
------BEGIN CURVE KEYPAIR-----
-${local_hex_key}
------END CURVE KEYPAIR-----
-EOF
+    echo "Generating server CURVE Ed25519 keypair..."
+    openssl genpkey -algorithm Ed25519 -out "${SERVER_KEY_DIR}/server.pem" 2>/dev/null
     echo "Server key generated at ${SERVER_KEY_DIR}/server.pem"
+else
+    # Check if it's a placeholder (random hex) and regenerate
+    if ! grep -q "BEGIN PRIVATE KEY\|PUBLIC KEY" "${SERVER_KEY_DIR}/server.pem" 2>/dev/null; then
+        echo "Warning: Server key is a placeholder. Regenerating with real Ed25519 key..."
+        openssl genpkey -algorithm Ed25519 -out "${SERVER_KEY_DIR}/server.pem" 2>/dev/null
+        echo "Server key regenerated at ${SERVER_KEY_DIR}/server.pem"
+    fi
 fi
 
-# Generate agent key if not exists
+# Generate agent key if not exists (or placeholder)
 if [ ! -f "${AGENT_KEY_DIR}/agent.pem" ]; then
     echo ""
-    echo "Generating agent CURVE keypair..."
-
-    # Generate 64 hex characters (32 bytes for x25519 private key)
-    local_hex_key=$(head -c 32 /dev/urandom | od -An -t x1 | tr -d ' \n')
-
-    cat > "${AGENT_KEY_DIR}/agent.pem" << EOF
------BEGIN CURVE KEYPAIR-----
-${local_hex_key}
------END CURVE KEYPAIR-----
-EOF
+    echo "Generating agent CURVE Ed25519 keypair..."
+    openssl genpkey -algorithm Ed25519 -out "${AGENT_KEY_DIR}/agent.pem" 2>/dev/null
     echo "Agent key generated at ${AGENT_KEY_DIR}/agent.pem"
+else
+    # Check if it's a placeholder (random hex) and regenerate
+    if ! grep -q "BEGIN PRIVATE KEY\|PUBLIC KEY" "${AGENT_KEY_DIR}/agent.pem" 2>/dev/null; then
+        echo "Warning: Agent key is a placeholder. Regenerating with real Ed25519 key..."
+        openssl genpkey -algorithm Ed25519 -out "${AGENT_KEY_DIR}/agent.pem" 2>/dev/null
+        echo "Agent key regenerated at ${AGENT_KEY_DIR}/agent.pem"
+    fi
 fi
 
 echo ""
@@ -65,10 +62,13 @@ echo ""
 echo "Server key:  ${SERVER_KEY_DIR}/server.pem"
 echo "Agent key:   ${AGENT_KEY_DIR}/agent.pem"
 echo ""
-echo "Location: Both keys are in tools/ subdirectory of their respective apps"
+echo "Both keys are REAL Ed25519 CURVE keypairs compatible with ed25519-dalek."
+echo ""
+echo "Key format:"
+echo "  PRIVATE KEY (PEM) - used for signing authentication messages"
 echo ""
 echo "To use with server:"
-echo "  cargo run --bin tunnel-server /path/to/config/server.toml \\"
+echo "  cargo run --bin tunnel-server config.toml \\"
 echo "    --key-file ${SERVER_KEY_DIR}/server.pem"
 echo ""
 echo "To use with agent:"

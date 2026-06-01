@@ -11,16 +11,16 @@ pub enum TunnelError {
     Zmq(String),
 
     #[error("Serialization error: {0}")]
-    Serialize(#[from] rmp_serde::encode::Error),
+    Serialize(rmp_serde::encode::Error),
 
     #[error("Deserialization error: {0}")]
-    Deserialize(#[from] rmp_serde::decode::Error),
+    Deserialize(rmp_serde::decode::Error),
 
     #[error("Tunnel error: {0}")]
     Tunnel(String),
 
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
 }
 
 /// Forwarding mode: remote or local
