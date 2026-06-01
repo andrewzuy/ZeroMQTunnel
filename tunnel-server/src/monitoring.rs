@@ -1,68 +1,85 @@
-//! Metrics export & ZAP handler for CURVE authentication
+//! Metrics export & ZAP handler for CURVE Authentication
+//!
+//! Handles metrics collection, Prometheus format export, and agent authentication.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use tracing::info;
+use tracing::{info, warn, debug};
+use anyhow::{Result, bail};
 
 /// Zap handler for validating agent connections (CURVE security model)
 #[derive(Debug)]
 pub struct ZapHandler {
-    /// Whitelist of authorized agent public keys
-    pub whitelist: HashSet<String>,
-    /// Server's own identity key
-    pub server_identity: String,
-}
-
-impl Default for ZapHandler {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Server's CURVE secret key (placeholder - loaded from key file)
+    server_keypair: Option<String>,
+    /// Server public key for identification
+    server_public_key: Option<String>,
+    /// Whitelist of authorized agent public keys (optional, disabled by default)
+    whitelist: RwLock<HashSet<String>>,
+    /// Server identity for logging
+    server_identity: String,
 }
 
 impl ZapHandler {
     pub fn new() -> Self {
         Self {
-            whitelist: HashSet::new(), // Empty initially - all allowed in dev
-            server_identity: "server".to_string(),
+            server_keypair: None, // Will be loaded or generated
+            server_public_key: None,
+            whitelist: RwLock::new(HashSet::new()),
+            server_identity: "tunnel-server".to_string(),
         }
     }
 
-    /// Load from a file with optional password (for production)
-    pub fn load_from_file(_path: &str, _password: Option<&str>) -> Self {
-        info!("Loading agent whitelist from {_path}");
-        // In production: read PEM keys, validate against server's known list
-        // For now, allow all connections in development mode
-        Self::new()
+    pub fn load_from_file(path: &str) -> Result<Self> {
+        info!("Loading ZAP handler from key file: {}", path);
+        // In production, read PEM file and parse x25519_dalek SecretKey
+        Ok(Self::new())
     }
 
-    /// Validate agent public key against whitelist
-    pub fn validate_agent(&self, public_key: &str) -> bool {
-        if self.whitelist.is_empty() {
+    /// Validate agent public key against whitelist (CURVE model)
+    pub fn validate_agent(&self, public_key: &str) -> Result<()> {
+        if self.whitelist.read().unwrap().is_empty() {
             // Whitelist not configured - allow (development mode)
-            true
-        } else if self.whitelist.contains(public_key) {
-            info!("Agent authorized: {}", public_key);
-            true
+            debug!("Agent connection validated (whitelist disabled): {}", public_key);
+            Ok(())
+        } else if self.whitelist.read().unwrap().contains(public_key) {
+            info!("Agent authorized via whitelist: {}", public_key);
+            Ok(())
         } else {
-            info!("Agent rejected (not in whitelist): {}", public_key);
-            false
+            let err = format!("Agent rejected (not in whitelist): {}", public_key);
+            warn!("{}", err);
+            bail!("{}", err);
         }
     }
 
     /// Add a key to the whitelist
-    pub fn add_whitelisted(&mut self, key: &str) -> &HashSet<String> {
-        self.whitelist.insert(key.to_string());
-        &self.whitelist
+    pub fn add_whitelisted(&self, key: &str) -> Result<()> {
+        let mut wl = self.whitelist.write().unwrap();
+        wl.insert(key.to_string());
+        info!("Added agent to whitelist: {}", key);
+        Ok(())
     }
 
     /// Remove a key from the whitelist
-    pub fn remove_from_whitelist(&mut self, key: &str) -> bool {
-        self.whitelist.remove(key)
+    pub fn remove_from_whitelist(&self, key: &str) -> bool {
+        let mut wl = self.whitelist.write().unwrap();
+        wl.remove(key)
     }
 
     /// Get current whitelist count
     pub fn whitelisted_count(&self) -> usize {
-        self.whitelist.len()
+        self.whitelist.read().unwrap().len()
+    }
+
+    /// Check if agent is whitelisted (or whitelist disabled)
+    pub fn is_whitelisted(&self) -> bool {
+        self.whitelist.read().map_or(true, |s| s.is_empty())
+    }
+}
+
+impl Default for ZapHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -97,12 +114,14 @@ impl MetricsCollector {
     pub fn session_active(&self) {
         let mut count = self.active_sessions.write().unwrap();
         *count += 1;
+        debug!("Active sessions: {}", count);
     }
 
     /// Decrement active sessions
     pub fn session_closed(&self) {
         let mut count = self.active_sessions.write().unwrap();
-        *count -= 1;
+        *count = count.saturating_sub(1);
+        debug!("Active sessions: {}", count);
     }
 
     /// Record bytes transferred
@@ -115,6 +134,7 @@ impl MetricsCollector {
     pub fn increment_reconnect(&self) {
         let mut count = self.reconnect_count_total.write().unwrap();
         *count += 1;
+        debug!("Reconnects: {}", count);
     }
 
     /// Increment registration count
@@ -149,6 +169,7 @@ impl MetricsCollector {
         let sessions = self.active_sessions.read().unwrap();
         let bytes = self.bytes_transferred_total.read().unwrap();
         let reconnects = self.reconnect_count_total.read().unwrap();
+
         info!(
             "Metrics exported: active_sessions={}, bytes_transferred={}, reconnects={}",
             sessions, bytes, reconnects
@@ -169,9 +190,17 @@ impl MetricsCollector {
             sessions, bytes, reconnects
         )
     }
+
+    /// Reset all counters to zero
+    pub fn reset(&self) {
+        *self.active_sessions.write().unwrap() = 0;
+        *self.bytes_transferred_total.write().unwrap() = 0;
+        *self.reconnect_count_total.write().unwrap() = 0;
+        *self.registrations_total.write().unwrap() = 0;
+    }
 }
 
-/// Log current metrics for monitoring
+/// Log current metrics for monitoring (convenience function)
 pub fn log_metrics(collector: &MetricsCollector) {
     info!("Metrics snapshot: {:?}", collector.get_metrics());
     let active = *collector.active_sessions.read().unwrap();

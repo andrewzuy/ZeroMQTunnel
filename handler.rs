@@ -1,8 +1,14 @@
-// Phase 4.2 - Control Handler with CURVE ZAP Validation
+//! Phase 4.2 - Control Handler with CURVE ZAP Validation
+//!
+//! Handles incoming connections on control socket, validates via ZAP protocol,
+//! and manages stream sessions for data plane forwarding.
 
 use crate::{config::ServerConfig, monitoring::ZapHandler};
+use anyhow::{Result, bail};
+use tracing::{debug, info, warn};
 
 /// ControlChannel struct for handling incoming connections on control socket
+#[derive(Debug)]
 pub struct ControlHandler {
     zap: ZapHandler,
     config: ServerConfig,
@@ -18,7 +24,8 @@ impl ControlHandler {
 
     /// Handle authentication via ZAP protocol (Phase 4.2 CURVE security model)
     pub async fn handle_zap(&self, public_key: &str) -> Result<bool, &'static str> {
-        self.zap.validate_agent(public_key);
+        self.zap.validate_agent(public_key)?;
+        info!("ZAP authentication succeeded for agent");
         Ok(true)
     }
 
@@ -26,10 +33,12 @@ impl ControlHandler {
 
     /// Send SHUTDOWN command to close all agent connections gracefully (Phase 3 resilience)
     pub async fn shutdown(_agents: &[&str]) {
-        println!("Tunnel server shutting down gracefully");
+        info!("Tunnel server shutting down gracefully");
     }
 }
 
+/// RegistrarControl for service registration and lifecycle management
+#[derive(Debug)]
 pub struct RegistrarControl;
 
 impl RegistrarControl {

@@ -1,0 +1,24 @@
+# ZeroMQ Tunnel Agent Configuration
+# Default location: tools/../tunnel-agent/config/
+# OR use --config flag with absolute path when starting agent
+
+[server]
+addr = "tcp://localhost:5555"     # Server control socket address (change for production)
+
+[identity]
+service_id = "web-443"            # Unique service identifier (human-readable)
+forward_mode = "remote"           # Forwarding mode: "remote" or "local"
+
+[port]
+port = 443                        # Target port for remote forwarding
+                                 # Or listener port for local forwarding mode
+
+[key]
+key_file = "../tools/config/agent.pem"     # Path to agent CURVE secret key (relative default)
+                                    # OR use absolute path like /etc/tunnel/agent.pem
+
+[heartbeat]
+interval = 30                     # Seconds between heartbeats to server
+
+[logging]
+level = "info"                    # One of: info, debug, trace
