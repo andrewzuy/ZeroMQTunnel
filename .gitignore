@@ -1,4 +1,0 @@
-/target/
-
-# Ignore generated CURVE keys (security - never commit private keys)
-*.pem
