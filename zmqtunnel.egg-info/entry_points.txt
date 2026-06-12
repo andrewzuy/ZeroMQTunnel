@@ -1,2 +1,0 @@
-[console_scripts]
-zmqtunnel = zmqtunnel.cli:main
