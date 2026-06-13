@@ -191,24 +191,25 @@ Frame 3: [payload         : raw bytes]   (optional, only for DATA)
 ### 7.1 Suggested Project Structure
 ```
 zmqtunnel/
-├── pyproject.toml
-├── zmqtunnel/
-│   ├── __init__.py
-│   ├── cli.py              # argument parsing, role dispatch
-│   ├── config.py           # config + key loading
-│   ├── protocol.py         # message types, encode/decode
-│   ├── crypto.py           # curve keypair gen, ZAP setup
+├── Cargo.toml
+├── src/
+│   ├── main.rs             # CLI entrypoint (subcommands: local, remote, server)
+│   ├── cli.rs              # argument parsing with clap
+│   ├── config.rs           # config + key loading
+│   ├── protocol.rs         # message types, encode/decode
+│   ├── crypto.rs           # curve keypair gen, ZAP setup
 │   ├── server/
-│   │   ├── broker.py       # ROUTER loop, routing table
-│   │   ├── registry.py     # sessions, tunnels, ACL
-│   │   └── auth.py         # ZAP authenticator wiring
+│   │   ├── broker.rs       # ROUTER loop, routing table
+│   │   ├── registry.rs     # sessions, tunnels, ACL
+│   │   └── auth.rs         # ZAP authenticator wiring
 │   ├── client/
-│   │   ├── agent.py        # DEALER loop + reconnection FSM
-│   │   ├── local_fwd.py    # ZMQ_STREAM listener side (-L)
-│   │   ├── remote_fwd.py   # ZMQ_STREAM dialer side (-R)
-│   │   └── conn_mgr.py     # conn_id <-> stream_id mapping
-│   ├── stream_bridge.py    # ZMQ_STREAM helpers (events, framing)
-│   └── reliability.py      # heartbeats, backoff, flow control
+│   │   ├── agent.rs        # DEALER loop + reconnection FSM
+│   │   ├── local_fwd.rs    # ZMQ_STREAM listener side (-L)
+│   │   ├── remote_fwd.rs   # ZMQ_STREAM dialer side (-R)
+│   │   └── conn_mgr.rs     # conn_id <-> stream_id mapping
+│   ├── stream_bridge.rs    # ZMQ_STREAM helpers (events, framing)
+│   └── reliability.rs      # heartbeats, backoff, flow control
+├── benches/                 # benchmarks
 └── tests/
 ```
 
@@ -347,20 +348,120 @@ async def run():
 
 ---
 
-## 13. Tech Stack Recommendation
+## 14. Rust Implementation Notes
 
-| Concern | Choice |
-|---------|--------|
-| Language | Python 3.11+ |
-| ZMQ binding | `pyzmq` |
-| Async | `asyncio` + `zmq.asyncio` |
-| Serialization | `msgpack` |
-| CLI | `typer` or `argparse` |
-| Config | `pydantic` + YAML |
-| Logging | `structlog` |
-| Packaging | `pyproject.toml` + `PyInstaller` (single binary) |
+### 14.1 Async Model Choice
+**Option 1: `tokio` with blocking `zmq` calls on single thread** — Recommended for v1. Matches the Python plan's poll loop structure but using tokio's executor:
+```rust
+#[tokio::main]
+async fn run() -> Result<()> {
+    let zmq = zmq::prelude::{Socket, SocketType};
+    let ctx = Context::new()?;
+    
+    // Create ROUTER socket (blocking calls on tokio)
+    let mut socket: Socket<SocketType::Router> = Socket::new(SocketType::Router, &ctx)?;
+    socket.set_curve_server(true)?;
+    socket.set_reconnect_ivl(250_ms())?;
+    
+    // Block until Ctrl-C
+    blocking::block_on(server_loop(&mut socket))?;
+    Ok(())
+}
+```
 
-> For higher performance / single-binary distribution, **Rust** (`zmq` crate + `tokio`) or **Go** (`goczmq`) are strong alternatives — same architecture applies.
+**Option 2: `tokio` async wrappers** — Available in dev builds (`zmq` crate + `zmq-async`). More complex but fully non-blocking.
+
+**Recommendation:** Start with Option 1 (blocking calls on tokio thread pool). It's simpler, easier to debug, and scales to ~10k connections on a single core before hitting GIL-style limits. Migrate to async only if profiling shows bottlenecks.
+
+---
+
+### 14.2 ZMQ_STREAM in Rust
+Rust's [`zmq`](https://docs.rs/zmq) crate currently treats `ZMQ_STREAM` as blocking-only. Options:
+- Block on tokio threads (recommended for v1, acceptable scaling).
+- Use `mio` + `tokio-io` custom wrappers for true async.
+- Prototype first with a simple echo server to verify events (`connect()`, `accept()` callbacks).
+
+**Tip:** Encapsulate all ZMQ_STREAM framing in `stream_bridge.rs` as planned, but use blocking poll in tokio tasks initially.
+
+---
+
+### 14.3 Auth & CurveZMQ Setup
+The [`zmq`](https://docs.rs/zmq) crate supports these modes:
+```rust
+let socket = Socket::new(SocketType::Dealer, &ctx)?;
+socket.set_curve_server(true)?;                    // Server mode
+// or
+socket.set_curve_client(true)?;                     // Client mode
+socket.set_require_cert(CertOpt::AllowClient)?;     // Whitelist clients
+```
+
+For ZAP whitelist authentication:
+- Store allowed client public keys in `~/.zmqtunnel/`.
+- Use [`anyhow`](https://docs.rs/anyhow) for error propagation (e.g., "client_pubkey not in allowlist").
+
+---
+
+### 14.4 Session & Reconnect State Machine
+Use Rust's `Enum` + `match` or [`enum_dispatch`] crate:
+```rust
+#[derive(Debug)]
+enum ClientState {
+    Connecting,
+    Authenticating,
+    Ready { session_id: String },
+    // ... etc
+}
+```
+
+On reconnect, drop all `conn_id`s (Option A) but preserve `tunnel_id` state in registry. This matches the plan's v1 design.
+
+---
+
+### 14.5 Flow Control Implementation
+Per-`conn_id` send window approach:
+```rust
+struct ConnState {
+    send_window: usize, // bytes allowed to queue
+    sent_bytes: usize,
+    paused: bool,
+}
+```
+- When HWM is hit, drop the `RecvMessage` and signal pause upstream via a closure or channel.
+- Resume reading when `recv()` succeeds again (credit-based flow control pattern).
+
+---
+
+### 14.6 Testing in Rust
+Use [`tokio-test`] for async testing:
+```rust
+#[tokio::test]
+async fn test_local_forward() {
+    let server = start_server().await;
+    let client = start_client_with_keys().await;
+    
+    spawn_local_listener(&client, "127.0.0.1:8080").await?;
+    assert_eq!(send_data(&client, b"hello world"), Ok(12));
+}
+```
+
+Integration tests use real HTTP servers (`actix-web` or `hyper`) as targets to verify end-to-end flows.
+
+---
+
+## 15. Comparison: Rust vs. Python for zmqtunnel v1
+
+| Aspect | **Rust** ✓ | Python |
+|--------|-----------|--------|
+| **Async model** | tokio (flexible, scalable) | asyncio (simple) |
+| **ZMQ binding** | `zmq` sys crate + `tokio` wrappers | `pyzmq` mature |
+| **ZMQ_STREAM** | Blocking on threads (good enough) | Native support |
+| **Memory safety** | ✓ Zero-cost, no GC | ✓ Refs/GC overhead |
+| **Binary size** | ~5–10 MB single binary | ~30 MB (PyInstaller) |
+| **Debugging** | Line-level stack traces + async proctets | Full backtrace + pdb |
+| **Learning curve** | Steeper, but pays off long-term | Shallow |
+| **Time to MVP** | 3–4 weeks | 1–2 weeks (can migrate later) |
+
+**Rust wins here**: the complexity is in the protocol/relay logic, not low-level I/O. Rust's async model handles that beautifully, and zero-cost abstractions mean no hidden performance overheads on v1.
 ```
 
 This gives you a complete, copy-ready blueprint. The trickiest parts will be **`ZMQ_STREAM` framing** (Phase 4) and **flow control** (Phase 6) — I'd suggest prototyping those early with a throwaway script before committing to the full structure.

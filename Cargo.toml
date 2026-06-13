@@ -1,0 +1,36 @@
+[package]
+name = "zmqtunnel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zmqtunnel"
+path = "src/main.rs"
+
+[dependencies]
+# ZMQ binding (v0.10)  
+zmq = "0.10"
+tokio = { version = "1", features = ["full"] }
+
+# Serialization  
+serde_yaml = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+
+# Error handling
+anyhow = "1.0"
+rmp-serde = "1.1"
+
+# CLI  
+clap = { version = "4.4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], default-features = false }
+
+# Cryptography
+rand = "0.8"  
+hex = "0.4"
+dirs = "5"
+
+[dev-dependencies]
+tokio-test = "0.4"
