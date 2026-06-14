@@ -1,0 +1,1 @@
+./tests/run_all_tests.sh: line 21: /home/andrew/Development/ZeroMQTunnel/chat/tests/../chat-server: No such file or directory

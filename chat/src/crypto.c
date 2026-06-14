@@ -2,11 +2,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <openssl/evp.h>
 
 unsigned int next_crypto_ctx_idx = 0;
 static crypto_key_t g_crypto_store[32];
 
+/* Generate RSA-2048 keypair (stub for Phase 2-7) */
 crypto_key_t *generate_rsa_keypair(const char *priv_path, const char *pub_path) {
     if (!priv_path || !pub_path || next_crypto_ctx_idx >= 32) return NULL;
     
@@ -19,7 +19,7 @@ crypto_key_t *generate_rsa_keypair(const char *priv_path, const char *pub_path) 
     return key;
 }
 
-/* Compute SHA256 fingerprint */
+/* Compute SHA256 fingerprint placeholder */
 void fingerprint_from_pkey(EVP_PKEY *pkey, unsigned char out_fp[65]) {
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
     if (!mdctx) return;
@@ -28,5 +28,3 @@ void fingerprint_from_pkey(EVP_PKEY *pkey, unsigned char out_fp[65]) {
     EVP_DigestSignFinal(mdctx, out_fp, (size_t*)&sha_len);
     EVP_MD_CTX_free(mdctx);
 }
-
-#endif /* CRYPTO_C */

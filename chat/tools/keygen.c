@@ -1,21 +1,26 @@
+#include "crypto.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include "crypto.h"
+#include <unistd.h>
+
+struct config { const char *priv_key_path; } g_cfg = {""};
+
+/* Initialize key generation with configuration */
+void init_crypto_context_init(const struct config *cfg) { 
+    if (cfg) strncpy(g_cfg.priv_key_path, cfg->priv_key_path, 256); 
+}
 
 int main(int argc, char **argv) {
-    const char *priv_path = NULL;
-    const char *pub_path = NULL;
+    char priv_path[256] = "", pub_path[256] = "";
     
-    if(argc >= 3) {
-        priv_path = argv[1];
-        pub_path = argv[2];
-    } else if(argc == 2) {
-        priv_path = argv[1];
-        pub_path = priv_path;
+    /* Simple two-key RSA-2048 pair generation */
+    if (generate_rsa_keypair(g_cfg.priv_key_path ? g_cfg.priv_key_path : NULL, 
+                              "test.pub") == NULL) {
+        return 1;
     }
     
-    printf("Generating RSA-2048 keypair...\n");
-    crypto_context = generate_rsa_keypair(priv_path, pub_path);
-    
-    return crypto_context ? 0 : 1;
+    return 0;
 }
+
+/* Cleanup context before exit */
+void cleanup(void *ctx) { crypto_cleanup(ctx); }
