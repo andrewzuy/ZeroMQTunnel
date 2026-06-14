@@ -1,468 +1,275 @@
-```markdown
-# ZMQ Tunnel Tool — Implementation Plan
-
-A tool providing **SSH-like local and remote port forwarding** over **CurveZMQ-encrypted, auto-reconnecting tunnels**, where all traffic between two clients is **mediated by a central server**.
-
----
+# End-to-End Encrypted Relay Chat – Development Plan
 
 ## 1. Overview
-
-### 1.1 Goal
-Build a CLI tool (`zmqtunnel`) that runs in three roles:
-
-- **Server (broker/relay):** Central mediator. All client-to-client traffic passes through it.
-- **Client (local-forward mode):** Mimics `ssh -L` — listens locally, forwards to a remote target via the server.
-- **Client (remote-forward mode):** Mimics `ssh -R` — server-side client exposes a listener; traffic is forwarded back to the originating client's target.
-
-### 1.2 SSH Equivalents
-
-| SSH Command | Tool Equivalent | Description |
-|-------------|-----------------|-------------|
-| `ssh -L 8080:target:80 server` | `zmqtunnel local -L 8080:target:80` | Local listener → forwarded to target |
-| `ssh -R 9090:target:22 server` | `zmqtunnel remote -R 9090:target:22` | Remote listener on server side → forwarded to client's target |
-
-### 1.3 Core Properties
-- 🔒 **Encrypted:** CurveZMQ for all client↔server links.
-- 🔁 **Reliable:** Auto-reconnect, heartbeats, message acknowledgment, session resumption.
-- 🌐 **Mediated:** No direct client-to-client connections; server relays everything.
-- 🧩 **Multiplexed:** Many TCP connections multiplexed over a single ZMQ link per client.
+**Goal:** Build a command-line chat application in plain C where clients exchange text and binary messages via a central relay server.  
+**Security:** The server **must not** be able to read message content. It only forwards encrypted blobs. Connection is allowed only if the server holds the client’s public key (whitelist).  
+**Libraries:** ZeroMQ for network messaging, OpenSSL for all cryptographic operations.  
+**Interface:** Clients interact via `stdin` / `stdout`.
 
 ---
 
-## 2. Architecture
+## 2. System Architecture
++----------------+ ZeroMQ (ROUTER/DEALER) +----------------+
+| Client A | <--------------------------------------> | |
+| (DEALER socket)| | Relay Server |
++----------------+ | (ROUTER socket)|
+| |
++----------------+ | |
+| Client B | <--------------------------------------> | |
+| (DEALER socket)| +----------------+
++----------------+
 
-### 2.1 Topology
-
-```
-                          ┌────────────────────────┐
-                          │        SERVER          │
-                          │   (ROUTER + Curve)     │
-                          │   Session Registry     │
-                          │   Connection Router    │
-                          └───────────┬────────────┘
-                                      │
-                ┌─────────────────────┴─────────────────────┐
-                │  encrypted ZMQ (CurveZMQ)                  │
-        ┌───────┴────────┐                          ┌────────┴───────┐
-        │   CLIENT A     │                          │   CLIENT B     │
-        │ (DEALER+Curve) │                          │ (DEALER+Curve) │
-        │ ZMQ_STREAM     │                          │ ZMQ_STREAM     │
-        │ local listener │                          │ target dialer  │
-        └───────┬────────┘                          └────────┬───────┘
-                │                                            │
-        ┌───────┴────────┐                          ┌────────┴───────┐
-        │ Local TCP app  │                          │ Remote service │
-        │ (e.g. browser) │                          │ (e.g. :80)     │
-        └────────────────┘                          └────────────────┘
-```
-
-### 2.2 Socket Strategy
-
-| Component | ZMQ Socket | Purpose |
-|-----------|-----------|---------|
-| Server control plane | `ROUTER` (Curve server) | Receives from all clients, routes by identity |
-| Client control plane | `DEALER` (Curve client) | Persistent link to server |
-| Edge TCP termination | `ZMQ_STREAM` | Terminate raw TCP at listener / dialer side |
-
-> **Note:** `DEALER`/`ROUTER` is used for the encrypted core because CurveZMQ does **not** work with `ZMQ_STREAM`. The `ZMQ_STREAM` sockets live entirely inside each client process and never touch the network — they only bridge local TCP to the in-process logic.
+- **Client** uses a `ZMQ_DEALER` socket for asynchronous, identity‑based communication.
+- **Server** uses a `ZMQ_ROUTER` socket that receives an identity frame automatically.
+- Identities are managed by ZeroMQ; the server maps them to authenticated users.
+- All message payloads are **end‑to‑end encrypted** – the server sees only ciphertext and metadata (sender/recipient fingerprints, timestamps).
 
 ---
 
-## 3. Data Flow
+## 3. Security Design & Protocol
 
-### 3.1 Local Forwarding (`ssh -L`)
+### 3.1 Keys & Trust
+- Every client generates an **RSA‑2048** key pair (or ECDSA/ECDH later, for efficiency).
+- Public keys are exchanged out‑of‑band and stored in the server’s whitelist (directory of `.pem` files).
+- Private keys never leave the client machine.
 
-```
-1. Client A binds ZMQ_STREAM listener on local port 8080.
-2. Browser connects → ZMQ_STREAM emits connect event (stream_id).
-3. Client A sends OPEN_CONN{tunnel_id, conn_id, target} to Server via DEALER.
-4. Server forwards OPEN_CONN to Client B (owner of target).
-5. Client B dials target:80 via outbound ZMQ_STREAM, maps conn_id ↔ stream_id.
-6. Bytes flow:  Browser → ZMQ_STREAM → DATA frame → Server → DATA frame → Client B → target.
-7. Reverse path symmetric.
-8. On TCP close, CLOSE_CONN propagates and tears down the mapping.
-```
+### 3.2 Authentication Handshake (Connection Establishment)
+1. Client connects and sends `HELLO <fingerprint>` (SHA‑256 of its public key).
+2. Server looks up fingerprint in its whitelist:
+   - Unknown → disconnect.
+   - Known → server replies `CHALLENGE <random‑nonce>`.
+3. Client signs the nonce with its private key, sends `AUTH <signature>`.
+4. Server verifies signature using the stored public key:
+   - Success → connection marked as authenticated for that user.
+   - Failure → disconnect.
 
-### 3.2 Remote Forwarding (`ssh -R`)
+### 3.3 Message Sending Protocol
+For every message from A → B:
+1. A builds a plaintext message (text or binary).
+2. A generates an ephemeral AES‑256 key and a random IV.
+3. Encrypts plaintext with AES‑256‑CBC (or GCM for authenticated encryption).
+4. Encrypts the AES key with B’s RSA public key (`RSA_public_encrypt`).
+5. Creates a payload:  
+   `timestamp (8 bytes) || RSA_encrypted_AES_key || IV || AES_ciphertext`.
+6. Signs `recipient_fingerprint || timestamp || RSA_encrypted_AES_key || IV || AES_ciphertext` with A’s private key.
+7. Sends to server as a multipart ZeroMQ message:
+   - Frame 0: `"MSG"`
+   - Frame 1: recipient fingerprint (string)
+   - Frame 2: `timestamp || encrypted_payload || signature`
 
-```
-1. Client A requests Server to open a listener on the server side (or on Client B).
-2. Server/Client B binds ZMQ_STREAM listener on remote port 9090.
-3. Inbound connection → OPEN_CONN routed back to Client A.
-4. Client A dials its local target (e.g. localhost:22).
-5. Bidirectional relay as above.
-```
+**Server processing:**
+- Extracts sender identity from the authenticated connection.
+- Verifies signature using sender’s public key over `recipient_fingerprint || timestamp || encrypted_payload`.
+- If valid, forwards unchanged payload to the recipient, prepending the sender’s fingerprint:
+  - Frame 0: `"MSG"`
+  - Frame 1: sender fingerprint
+  - Frame 2: the same binary payload
 
----
+**Recipient:**
+- Verifies signature with sender’s public key.
+- Decrypts AES key with its own private key.
+- Decrypts the message with AES.
+- Outputs the original plaintext.
 
-## 4. Protocol Design
+### 3.4 Binary Data
+- The same pipeline works for binary data; all payloads are treated as opaque byte arrays.
+- The `stdin`/`stdout` interface will use a simple escape/prefix mechanism (e.g., `:bin <hex>` or a length‑prefixed mode) to distinguish text and binary input. Details in Phase 6.
 
-### 4.1 Message Envelope
-
-Every relayed message is multipart. Use a compact binary header (e.g., MessagePack or a custom struct).
-
-```
-Frame 0: [protocol_version : uint8]
-Frame 1: [msg_type        : uint8]
-Frame 2: [header          : msgpack dict]
-Frame 3: [payload         : raw bytes]   (optional, only for DATA)
-```
-
-### 4.2 Message Types
-
-| Type | Direction | Header Fields | Description |
-|------|-----------|---------------|-------------|
-| `HELLO` | client → server | `client_id`, `auth_token`, `resume_session?` | Register / authenticate |
-| `HELLO_ACK` | server → client | `session_id`, `assigned_id` | Confirm registration |
-| `REGISTER_FORWARD` | client → server | `mode (L/R)`, `bind_addr`, `target`, `peer_id` | Declare a forward rule |
-| `FORWARD_ACK` | server → client | `tunnel_id`, `status` | Forward accepted/rejected |
-| `OPEN_CONN` | bidirectional | `tunnel_id`, `conn_id`, `target` | New TCP connection opened |
-| `OPEN_ACK` | bidirectional | `conn_id`, `status` | Target dial succeeded/failed |
-| `DATA` | bidirectional | `conn_id`, `seq` | Raw stream bytes (payload frame) |
-| `CLOSE_CONN` | bidirectional | `conn_id`, `reason` | Connection torn down |
-| `PING` / `PONG` | bidirectional | `timestamp` | Heartbeat / liveness |
-| `ERROR` | server → client | `code`, `message` | Protocol or routing error |
-
-### 4.3 Identifiers
-- `client_id`: stable, derived from client's Curve public key (e.g., Z85-encoded).
-- `session_id`: server-assigned, used for resumption after reconnect.
-- `tunnel_id`: per forward rule.
-- `conn_id`: per TCP connection within a tunnel (UUID or monotonic counter scoped to tunnel).
+### 3.5 Replay Protection
+- Timestamps (UTC, millisecond precision) and a sliding window on the recipient side are used. Recipient keeps last N message hashes/timestamps per sender to detect replays.
 
 ---
 
-## 5. Security (CurveZMQ)
-
-### 5.1 Key Management
-- Each **server** has a long-term Curve keypair. Public key is distributed to clients out-of-band (config file / QR / paste).
-- Each **client** has a long-term Curve keypair. Public key registered server-side for authorization.
-
-### 5.2 Authentication Model
-1. **Transport layer:** CurveZMQ encrypts + authenticates the link (client must know server's public key; server validates client public key).
-2. **Application layer:** Use `ZAP` (ZeroMQ Authentication Protocol) via `ThreadAuthenticator`:
-   - `configure_curve(domain='*', location=allowed_keys_dir)` — only whitelisted client public keys may connect.
-3. **Optional:** Additional `auth_token` in `HELLO` for revocable session-level auth.
-
-### 5.3 Authorization (Forward Rules)
-- Server maintains an ACL: which `client_id` may open which forwards / reach which peers.
-- Reject `REGISTER_FORWARD` if not permitted.
-
-### 5.4 Config Layout
-```
-~/.zmqtunnel/
-├── server_public.key
-├── client_secret.key
-├── client_public.key
-└── config.yaml
-```
+## 4. Development Environment & Dependencies
+- **Language:** C99 or C11 (plain C, no C++)
+- **Build system:** CMake (portable, easy ZeroMQ/OpenSSL integration)
+- **Libraries:**
+  - `libzmq` (ZeroMQ ≥ 4.3)
+  - `libssl` and `libcrypto` (OpenSSL ≥ 1.1.1)
+- **Platform:** Linux (primary), macOS and Windows (MinGW/Cygwin) as secondary targets.
+- **Tools:** `gcc` or `clang`, `cmake`, `make`, `pkg-config`, `valgrind` (memory checks), `cppcheck` (static analysis).
 
 ---
 
-## 6. Reliability & Reconnection
+## 5. Development Phases
 
-### 6.1 ZMQ Built-in Resilience
-- `DEALER` auto-reconnects on drop. Configure:
-  - `ZMQ_RECONNECT_IVL` (e.g., 250 ms)
-  - `ZMQ_RECONNECT_IVL_MAX` (exponential backoff cap, e.g., 30 s)
-  - `ZMQ_HEARTBEAT_IVL`, `ZMQ_HEARTBEAT_TIMEOUT`, `ZMQ_HEARTBEAT_TTL` (ZMTP heartbeats)
-  - `ZMQ_SNDHWM` / `ZMQ_RCVHWM` (tune for backpressure)
-  - `ZMQ_TCP_KEEPALIVE` settings
-
-### 6.2 Application-Level Heartbeats
-- Send `PING`/`PONG` every N seconds as a higher-level liveness signal independent of ZMTP.
-- If no `PONG` within timeout → mark link dead → trigger reconnect logic.
-
-### 6.3 Session Resumption
-- On reconnect, client sends `HELLO` with previous `session_id`.
-- Server attempts to rebind existing tunnel state to the new ZMQ identity.
-- **Important caveat:** TCP connections (`conn_id`) cannot survive a true link outage cleanly because in-flight bytes may be lost. Strategy:
-  - **Option A (simple):** Drop all active `conn_id`s on reconnect; only forward *rules* (`tunnel_id`) persist. New connections work immediately. (Recommended for v1.)
-  - **Option B (advanced):** Add per-connection sequence numbers + buffered resend for short outages. Higher complexity.
-
-### 6.4 Backpressure & Flow Control
-- ZMQ buffers can grow unbounded → memory risk. Implement:
-  - Per-`conn_id` send window / credit-based flow control, OR
-  - Monitor HWM and pause reading from the corresponding ZMQ_STREAM socket when downstream is congested.
-
----
-
-## 7. Module Breakdown
-
-### 7.1 Suggested Project Structure
-```
-zmqtunnel/
-├── Cargo.toml
+### Phase 0 – Project Setup & Build System
+- Create directory structure:
+chat/
+├── CMakeLists.txt
 ├── src/
-│   ├── main.rs             # CLI entrypoint (subcommands: local, remote, server)
-│   ├── cli.rs              # argument parsing with clap
-│   ├── config.rs           # config + key loading
-│   ├── protocol.rs         # message types, encode/decode
-│   ├── crypto.rs           # curve keypair gen, ZAP setup
-│   ├── server/
-│   │   ├── broker.rs       # ROUTER loop, routing table
-│   │   ├── registry.rs     # sessions, tunnels, ACL
-│   │   └── auth.rs         # ZAP authenticator wiring
-│   ├── client/
-│   │   ├── agent.rs        # DEALER loop + reconnection FSM
-│   │   ├── local_fwd.rs    # ZMQ_STREAM listener side (-L)
-│   │   ├── remote_fwd.rs   # ZMQ_STREAM dialer side (-R)
-│   │   └── conn_mgr.rs     # conn_id <-> stream_id mapping
-│   ├── stream_bridge.rs    # ZMQ_STREAM helpers (events, framing)
-│   └── reliability.rs      # heartbeats, backoff, flow control
-├── benches/                 # benchmarks
+│ ├── server.c, server.h
+│ ├── client.c, client.h
+│ ├── protocol.h
+│ ├── crypto.c, crypto.h
+│ ├── transport.c, transport.h
+│ └── utils.c, utils.h
+├── include/
+├── keys/ (sample keys, server whitelist)
 └── tests/
-```
 
-### 7.2 Key Responsibilities
+- Write `CMakeLists.txt`: find packages `ZeroMQ` and `OpenSSL`, define `chat-server` and `chat-client` targets.
+- Implement a simple logging utility (`utils.c`) with levels (DEBUG, INFO, WARN, ERROR).
 
-**`protocol.py`**
-- `encode(msg_type, header, payload) -> list[bytes]`
-- `decode(frames) -> Message`
-- Constants for all message types.
+### Phase 1 – Basic ZeroMQ Communication Skeleton
+- **Server:** create a `ROUTER` socket bound to a configurable endpoint (e.g., `tcp://*:5555`). Infinite loop receiving multipart messages, printing identity and payload (raw).
+- **Client:** create a `DEALER` socket, set identity (random UUID or `pid`), connect to server. Send a test `"PING"` and wait for `"PONG"`.
+- Goal: verify messaging works, identities are preserved.
 
-**`server/broker.py`**
-- Main `ROUTER` poll loop.
-- Route incoming frames to destination client by looking up registry.
-- Prepend correct ZMQ identity for outgoing routing.
+### Phase 2 – Key Generation & Management
+- Implement `crypto.c`:
+- `generate_keypair()`: generate RSA 2048, save private to file, public to file (PEM).
+- `load_public_key(filename)`, `load_private_key(filename)`.
+- `fingerprint(key)`: SHA‑256 of DER‑encoded public key, output as hex string.
+- `sign(private_key, data, len)`, `verify(public_key, data, len, signature)`.
+- `rsa_encrypt(public_key, data, len)`, `rsa_decrypt(private_key, data, len)`.
+- `aes_encrypt(key, iv, plaintext)`, `aes_decrypt(key, iv, ciphertext)`.
+- Add a small utility to generate keys for testing.
+- Server whitelist: simple directory scan at startup; store fingerprints → public key mapping.
 
-**`server/registry.py`**
-- `sessions: {session_id: ClientSession}`
-- `tunnels: {tunnel_id: TunnelSpec}`
-- `routes: {(client_id, conn_id): peer_client_id}`
-- ACL checks.
+### Phase 3 – Authentication Handshake
+- **Client:**
+- After connection, load its own key pair.
+- Compute fingerprint, send `HELLO <fp>`.
+- Await `CHALLENGE <nonce>`.
+- Sign nonce, send `AUTH <signature>`.
+- Wait for `WELCOME` or `ERROR`.
+- **Server:**
+- On `HELLO`, look up fingerprint in whitelist. If not found, send `ERROR` and disconnect.
+- Generate random nonce (32 bytes), send `CHALLENGE`.
+- On `AUTH`, verify signature. If ok, mark connection as authenticated (store identity → fingerprint mapping), send `WELCOME`.
+- Store per‑connection state (authenticated flag, peer fingerprint).
 
-**`client/agent.py`**
-- Establish Curve-encrypted DEALER connection.
-- Reconnection state machine (CONNECTING → AUTHENTICATING → READY → RECONNECTING).
-- Dispatch inbound messages to local/remote forward handlers.
+### Phase 4 – Secure Message Exchange (Client ↔ Server)
+- Implement full message composition (AES + RSA + sign) as described in §3.3.
+- Implement decryption + verification on receiving side.
+- At this stage, test with a dummy “loopback” server that only echoes back, but verifies signatures. (Later the real relay will forward.)
+- Key point: ensure server code **never** holds private keys or performs decryption.
 
-**`client/conn_mgr.py`**
-- Bidirectional map: `conn_id ↔ zmq_stream_identity`.
-- Lifecycle: open → active → closing → closed.
+### Phase 5 – Server Relay & Routing
+- Server maintains a table: `{ fingerprint → connection_identity }` (the ZeroMQ identity).
+- When a `MSG` arrives from an authenticated connection:
+- Verify signature (must match connection’s fingerprint).
+- Extract recipient fingerprint from frame 1.
+- Look up recipient’s connection identity (must be online).
+- Forward message prepending sender fingerprint.
+- If recipient offline, optionally queue (for later implementation) or reply `ERROR` to sender.
+- Handle disconnections: clean up table entries.
 
----
+### Phase 6 – Client stdin/stdout Interface
+- Use `select()` or a simple multi‑threaded approach (one thread for ZeroMQ, one for stdin) – or non‑blocking loop with `zmq_poll`.
+- Incoming messages from network: output to `stdout` in format:
+- Text: `<sender_fp> [HH:MM:SS] message`
+- Binary: `<sender_fp> [HH:MM:SS] <binary size=XYZ bytes>` then hex dump or redirection hint.
+- Outgoing user input:
+- Normal text lines: send as plaintext to a default recipient (configurable).
+- Commands prefixed with `/`:
+  - `/to <fingerprint>` – set current recipient.
+  - `/bin <filename>` – read file and send as binary.
+  - `/quit`
+- `/raw` to enter raw mode for piping binary data.
+- Handle binary safety: messages passed internally as `uint8_t*` + length.
 
-## 8. Event Loop Strategy
+### Phase 7 – Binary Data Support
+- Ensure all cryptographic functions operate on binary buffers, no string assumptions.
+- Extend the message payload to contain a `content_type` byte (e.g., `0x00` = text, `0x01` = binary) so receiver can display appropriately.
+- Test with files (images, etc.).
 
-Choose one approach (be consistent):
+### Phase 8 – Error Handling, Logging, Configuration
+- Every ZeroMQ call checked, all OpenSSL errors retrieved with `ERR_get_error()`.
+- Server and client read a configuration file (ini style or JSON via jsmn) for:
+- Server port, whitelist directory, log level.
+- Client private key path, server address, default recipient.
+- Graceful shutdown (SIGINT handler) – close sockets, free memory.
+- Memory management: use clean allocation/deallocation, run Valgrind regularly.
 
-- **Option 1: `zmq.Poller`** — classic, synchronous, single-threaded poll over all sockets.
-- **Option 2: `asyncio` + `zmq.asyncio`** — cleaner for concurrent connection handling. **Recommended.**
+### Phase 9 – Testing & Security Audit
+- **Unit tests** (using CMake/CTest) for:
+- Key generation, fingerprint computation.
+- Sign/verify, encrypt/decrypt cycles.
+- Protocol frame building/parsing.
+- **Integration tests** (bash scripts or Python test harness):
+- Two clients + one server, exchange text and binary.
+- Test replay detection.
+- Test server cannot read content (inspect server logs).
+- Authentication failure scenarios (wrong key, fake signature).
+- **Fuzz testing** on protocol parsers.
+- Manual code review focusing on buffer overflows, use of `memcpy`, input validation.
 
-### Recommended (asyncio) loop per client:
-```
-async def run():
-    await connect_with_curve()
-    await asyncio.gather(
-        zmq_recv_loop(),       # server → local
-        stream_recv_loop(),    # local TCP → server
-        heartbeat_loop(),
-        reconnect_supervisor(),
-    )
-```
-
----
-
-## 9. Implementation Phases
-
-### Phase 1 — Foundation
-- [ ] Project scaffolding, CLI skeleton (`local` / `remote` / `server` subcommands).
-- [ ] Curve keypair generation command (`zmqtunnel keygen`).
-- [ ] Config loading.
-
-### Phase 2 — Secure Transport
-- [ ] Server `ROUTER` with Curve + ZAP whitelist.
-- [ ] Client `DEALER` with Curve.
-- [ ] `HELLO` / `HELLO_ACK` handshake.
-- [ ] Echo test to verify encrypted round-trip.
-
-### Phase 3 — Protocol & Routing
-- [ ] Implement `protocol.py` (encode/decode all messages).
-- [ ] Server registry + routing of `OPEN_CONN` / `DATA` / `CLOSE_CONN`.
-
-### Phase 4 — Local Forwarding (`-L`)
-- [ ] `ZMQ_STREAM` listener, connect/disconnect event handling.
-- [ ] `conn_mgr` mapping.
-- [ ] End-to-end: local listener → server → peer dialer → target.
-
-### Phase 5 — Remote Forwarding (`-R`)
-- [ ] Reverse direction listener setup.
-- [ ] `REGISTER_FORWARD` with mode `R`.
-- [ ] End-to-end remote forward test.
-
-### Phase 6 — Reliability
-- [ ] Tune ZMQ reconnect/heartbeat socket options.
-- [ ] Application-level `PING`/`PONG`.
-- [ ] Reconnection FSM + session resumption (Option A: drop conns, keep rules).
-- [ ] Backpressure / flow control.
-
-### Phase 7 — Hardening & UX
-- [ ] ACL enforcement for forwards.
-- [ ] Structured logging + metrics (active conns, bytes, reconnects).
-- [ ] Graceful shutdown (drain + close conns).
-- [ ] Multiple simultaneous forward rules per client.
-
-### Phase 8 — Testing & Packaging
-- [ ] Unit tests for `protocol`, `conn_mgr`, `registry`.
-- [ ] Integration tests with real TCP echo / HTTP server.
-- [ ] Chaos test: kill server mid-transfer, verify recovery.
-- [ ] Package + distribute (PyPI / single binary via PyInstaller).
+### Phase 10 – Documentation & Packaging
+- `README.md`: build instructions, key generation, server setup, example usage.
+- Man pages or `--help` for client and server.
+- Provide a quick‑start script that generates test keys and launches a local setup.
 
 ---
 
-## 10. Testing Plan
+## 6. Implementation Details
 
-| Test | Method |
-|------|--------|
-| Encryption works | Verify ZAP rejects unknown keys; capture traffic, confirm ciphertext |
-| Local forward correctness | `curl` through `-L` tunnel to HTTP server |
-| Remote forward correctness | Reverse-connect via `-R`, hit a service |
-| Reconnection | Kill + restart server; confirm forward rules survive, new conns work |
-| Concurrency | Many parallel connections (e.g., `ab`, `wrk`) |
-| Large transfers | Stream multi-GB file; verify integrity (checksum) |
-| Backpressure | Slow consumer; confirm no unbounded memory growth |
-| Connection teardown | Abrupt client close; confirm `CLOSE_CONN` propagation |
+### Key Data Structures
 
----
+```c
+// server connection state
+typedef struct {
+  char identity[256];    // ZeroMQ identity
+  char fingerprint[65];  // hex SHA256
+  RSA *pubkey;           // loaded from whitelist
+  bool authenticated;
+} conn_t;
 
-## 11. Known Risks & Mitigations
+// message frame layout (inside payload)
+typedef struct {
+  uint64_t timestamp;
+  // followed by:
+  //   uint16_t rsa_encrypted_key_len;
+  //   uint8_t  rsa_encrypted_key[];
+  //   uint8_t  iv[16];
+  //   uint32_t ciphertext_len;
+  //   uint8_t  ciphertext[];
+  //   uint16_t signature_len;
+  //   uint8_t  signature[];
+} secure_payload_t;
 
-| Risk | Mitigation |
-|------|-----------|
-| ZMQ buffer growth (no native backpressure to TCP) | Credit-based flow control per conn_id |
-| In-flight data lost on reconnect | Document behavior; Option B resend buffer if needed |
-| `ZMQ_STREAM` byte-stream framing complexity | Encapsulate all framing in `stream_bridge.py` |
-| Curve key distribution | Provide `keygen` + clear docs; consider QR/paste helper |
-| Single server = SPOF | Document; future: multiple brokers / failover |
-| Head-of-line blocking on single DEALER link | Acceptable for v1; consider per-tunnel sockets later |
+Core Crypto Functions (crypto.c)
 
----
+    crypto_init() – seed PRNG, load OpenSSL error strings.
 
-## 12. Future Enhancements
-- 🔄 Multiple broker support / HA failover.
-- 📊 Web dashboard for live tunnel monitoring.
-- 🔐 Short-lived rotating session keys.
-- 🗜️ Optional payload compression.
-- 🪪 mTLS-style certificate model layered on top.
-- 📦 UDP forwarding support.
+    crypto_cleanup().
 
----
+    fingerprint_from_rsa(RSA *key, char hex_out[65]).
 
-## 14. Rust Implementation Notes
+    generate_nonce(unsigned char *buf, int len).
 
-### 14.1 Async Model Choice
-**Option 1: `tokio` with blocking `zmq` calls on single thread** — Recommended for v1. Matches the Python plan's poll loop structure but using tokio's executor:
-```rust
-#[tokio::main]
-async fn run() -> Result<()> {
-    let zmq = zmq::prelude::{Socket, SocketType};
-    let ctx = Context::new()?;
-    
-    // Create ROUTER socket (blocking calls on tokio)
-    let mut socket: Socket<SocketType::Router> = Socket::new(SocketType::Router, &ctx)?;
-    socket.set_curve_server(true)?;
-    socket.set_reconnect_ivl(250_ms())?;
-    
-    // Block until Ctrl-C
-    blocking::block_on(server_loop(&mut socket))?;
-    Ok(())
-}
-```
+    hybrid_encrypt(RSA *recip_pub, const unsigned char *plain, size_t plain_len, unsigned char **out, size_t *out_len).
 
-**Option 2: `tokio` async wrappers** — Available in dev builds (`zmq` crate + `zmq-async`). More complex but fully non-blocking.
+    hybrid_decrypt(RSA *my_priv, const unsigned char *in, size_t in_len, unsigned char **out, size_t *out_len).
 
-**Recommendation:** Start with Option 1 (blocking calls on tokio thread pool). It's simpler, easier to debug, and scales to ~10k connections on a single core before hitting GIL-style limits. Migrate to async only if profiling shows bottlenecks.
+    sign_data(RSA *priv, const unsigned char *data, size_t len, unsigned char **sig, size_t *sig_len).
 
----
+    verify_data(RSA *pub, const unsigned char *data, size_t len, const unsigned char *sig, size_t sig_len).
 
-### 14.2 ZMQ_STREAM in Rust
-Rust's [`zmq`](https://docs.rs/zmq) crate currently treats `ZMQ_STREAM` as blocking-only. Options:
-- Block on tokio threads (recommended for v1, acceptable scaling).
-- Use `mio` + `tokio-io` custom wrappers for true async.
-- Prototype first with a simple echo server to verify events (`connect()`, `accept()` callbacks).
+ZeroMQ Message Frames
 
-**Tip:** Encapsulate all ZMQ_STREAM framing in `stream_bridge.rs` as planned, but use blocking poll in tokio tasks initially.
+Multipart messages are built and parsed with zmq_msg_send/recv. Example for MSG send:
+zmq_send(socket, "MSG", 3, ZMQ_SNDMORE);
+zmq_send(socket, recipient_fp, 64, ZMQ_SNDMORE);
+zmq_send(socket, payload, payload_len, 0);
 
----
+7. Testing Strategy
 
-### 14.3 Auth & CurveZMQ Setup
-The [`zmq`](https://docs.rs/zmq) crate supports these modes:
-```rust
-let socket = Socket::new(SocketType::Dealer, &ctx)?;
-socket.set_curve_server(true)?;                    // Server mode
-// or
-socket.set_curve_client(true)?;                     // Client mode
-socket.set_require_cert(CertOpt::AllowClient)?;     // Whitelist clients
-```
+    Continuous Integration: GitHub Actions building on Ubuntu (gcc+clang) with ZeroMQ and OpenSSL from repos.
 
-For ZAP whitelist authentication:
-- Store allowed client public keys in `~/.zmqtunnel/`.
-- Use [`anyhow`](https://docs.rs/anyhow) for error propagation (e.g., "client_pubkey not in allowlist").
+    Memory: valgrind --leak-check=full on every test run.
 
----
+    Security: Test server internals – ensure no private keys, no decrypted content in logs.
 
-### 14.4 Session & Reconnect State Machine
-Use Rust's `Enum` + `match` or [`enum_dispatch`] crate:
-```rust
-#[derive(Debug)]
-enum ClientState {
-    Connecting,
-    Authenticating,
-    Ready { session_id: String },
-    // ... etc
-}
-```
+    Performance: Measure latency with ping‑like test, throughput for large binary transfers.
 
-On reconnect, drop all `conn_id`s (Option A) but preserve `tunnel_id` state in registry. This matches the plan's v1 design.
-
----
-
-### 14.5 Flow Control Implementation
-Per-`conn_id` send window approach:
-```rust
-struct ConnState {
-    send_window: usize, // bytes allowed to queue
-    sent_bytes: usize,
-    paused: bool,
-}
-```
-- When HWM is hit, drop the `RecvMessage` and signal pause upstream via a closure or channel.
-- Resume reading when `recv()` succeeds again (credit-based flow control pattern).
-
----
-
-### 14.6 Testing in Rust
-Use [`tokio-test`] for async testing:
-```rust
-#[tokio::test]
-async fn test_local_forward() {
-    let server = start_server().await;
-    let client = start_client_with_keys().await;
-    
-    spawn_local_listener(&client, "127.0.0.1:8080").await?;
-    assert_eq!(send_data(&client, b"hello world"), Ok(12));
-}
-```
-
-Integration tests use real HTTP servers (`actix-web` or `hyper`) as targets to verify end-to-end flows.
-
----
-
-## 15. Comparison: Rust vs. Python for zmqtunnel v1
-
-| Aspect | **Rust** ✓ | Python |
-|--------|-----------|--------|
-| **Async model** | tokio (flexible, scalable) | asyncio (simple) |
-| **ZMQ binding** | `zmq` sys crate + `tokio` wrappers | `pyzmq` mature |
-| **ZMQ_STREAM** | Blocking on threads (good enough) | Native support |
-| **Memory safety** | ✓ Zero-cost, no GC | ✓ Refs/GC overhead |
-| **Binary size** | ~5–10 MB single binary | ~30 MB (PyInstaller) |
-| **Debugging** | Line-level stack traces + async proctets | Full backtrace + pdb |
-| **Learning curve** | Steeper, but pays off long-term | Shallow |
-| **Time to MVP** | 3–4 weeks | 1–2 weeks (can migrate later) |
-
-**Rust wins here**: the complexity is in the protocol/relay logic, not low-level I/O. Rust's async model handles that beautifully, and zero-cost abstractions mean no hidden performance overheads on v1.
-```
-
-This gives you a complete, copy-ready blueprint. The trickiest parts will be **`ZMQ_STREAM` framing** (Phase 4) and **flow control** (Phase 6) — I'd suggest prototyping those early with a throwaway script before committing to the full structure.
+8. Potential Challenges & Mitigations
+Challenge	Mitigation
+RSA encryption size limit	Use hybrid encryption (AES session key).
+Connection identity persistence across reconnects	Use a client‑generated UUID as identity, stored in config.
+Replay attacks	Timestamp + sequence number, sliding window, duplicate cache.
+Offline message delivery	Phase‑2 feature: store encrypted messages on server, deliver on connect. Server still cannot decrypt.
+ZeroMQ multi‑thread safety	Keep socket operations in one thread per socket; use zmq_poll for multiplexing stdin and socket.
+Binary data on terminal	Use base64 encoding for display, raw mode for piping, /bin command to send files.
 
