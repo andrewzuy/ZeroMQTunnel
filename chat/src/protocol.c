@@ -1,33 +1,19 @@
 #include "protocol.h"
-#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <time.h>
-#include <sys/time.h>
 
 uint64_t get_timestamp_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
-}
-
-char* format_timestamp(uint64_t ts, char *buf, size_t buf_size) {
-    time_t t = (time_t)(ts / 1000);
-    static struct tm tm_buf;
-#if defined(_WIN32)
-    gmtime_s(&t, &tm_buf);
-#else
-    gmtime_r(&t, &tm_buf);
-#endif
-    strftime(buf, buf_size, "%H:%M:%S", &tm_buf);
-    return buf;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec/1000000;
 }
 
 char* format_hex(const unsigned char *data, size_t len, char *out, size_t out_size) {
-    (void)data;
-    (void)len;
-    (void)out;
-    (void)out_size;
-    return NULL;
+    if(len >= out_size) len = out_size - 1;
+    
+    for(size_t i = 0; i < len; i++) {
+        snprintf(out + (i*2), 3, "%02x", data[i]);
+    }
+    out[len*2] = '\0';
+    return out;
 }

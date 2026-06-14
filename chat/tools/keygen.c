@@ -1,21 +1,21 @@
-/* keygen - Utility tool to generate RSA-2048 key pairs for testing
- * Usage: ./keygen [priv_key.pem] [pub_key.pem]
- */
-
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-#include <openssl/rsa.h>
-#include <openssl/pem.h>
+#include "crypto.h"
 
-int main(int argc, char *argv[]) {
-    RSA *rsa = RSA_generate_key_ex(2048, RSA_F4, NULL, NULL);
+int main(int argc, char **argv) {
+    const char *priv_path = NULL;
+    const char *pub_path = NULL;
     
-    if (!rsa) {
-        fprintf(stderr, "Failed to generate key\n");
-        return 1;
+    if(argc >= 3) {
+        priv_path = argv[1];
+        pub_path = argv[2];
+    } else if(argc == 2) {
+        priv_path = argv[1];
+        pub_path = priv_path;
     }
     
+    printf("Generating RSA-2048 keypair...\n");
+    crypto_context = generate_rsa_keypair(priv_path, pub_path);
+    
+    return crypto_context ? 0 : 1;
 }

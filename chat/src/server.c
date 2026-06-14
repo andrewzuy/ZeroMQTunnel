@@ -7,23 +7,26 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
-static char g_server_addr[100] = "tcp://*:5555";
+static char server_addr[100] = "tcp://*:5555";
+server_config_t config;
 
-static struct {
-    int port;
-} g_config = {DEFAULT_PORT};
-
-void init_server() {
-    printf("Initializing relay server on port %d\n", g_config.port);
+void init_server(server_config_t *cfg) {
+    if(cfg) {
+        snprintf(server_addr, sizeof(server_addr), "tcp://*:%d", cfg->port);
+        strncpy(config.whitelist_dir, cfg->whitelist_dir, 256);
+        config.port = cfg->port;
+    } else {
+        config.port = 5555;
+        config.whitelist_dir[0] = '\0';
+    }
 }
 
-/* Parse command line arguments */
-int try_parse_port(const char *arg, int *port) {
-    sscanf(arg, "%d", port);
-    return 0;
+int init_server_port(int port) {
+    snprintf(server_addr, sizeof(server_addr), "tcp://*:%d", port);
+    printf("Server listening on port %d\n", port);
+    return port;
 }
 
-int try_parse_whitelist_dir(const char *path, char *dest) {
-    snprintf(dest, sizeof(dest), "%s", path);
-    return 0;
+void cleanup(void) {
+    printf("Server shutting down\n");
 }

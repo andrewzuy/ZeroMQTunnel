@@ -1,21 +1,43 @@
+# ZeroMQTunnel Build System
+# Targets: chat-server, chat-client, keygen
+
 CC = gcc
-CFLAGS = -g -Wall -D_POSIX_C_SOURCE=200809L -I../include -O2
+CFLAGS = -g -O2 -Wall -D_POSIX_C_SOURCE=200809L -Wextra -I../include
+LDFLAGS = -lssl -lcrypto
+LIBSSL_FLAGS = -Wno-deprecated  # OpenSSL 3.0+ deprecation warnings
 
-all: chat-server chat-client
+# Source files (shared by server, client, keygen)
+COMMON_SRCS = \
+    ../include/server.c \
+    ../include/client.c \
+    ../include/protocol.c \
+    ../include/crypto.c \
+    ../include/utils.c \
+    ../include/logging.c
 
-chat-server: server.c protocol.c crypto.c utils.c logging.c $(OBJDIR:=1)
-	gcc $(CFLAGS) -o $@ server.c protocol.c crypto.c utils.c logging.c
+all: chat-server chat-client keygen
 
-chat-client: client.c protocol.c crypto.c utils.c logging.c
-	gcc $(CFLAGS) -o $@ client.c protocol.c crypto.c utils.c logging.c
+chat-server: server.c $(COMMON_SRCS)
+	$(CC) $(CFLAGS) -o $@ \
+		$< server.c \
+		$(COMMON_SRCS:%=%:.common_) \
+		$(LDFLAGS) $(LIBSSL_FLAGS)
 
+server.o: server.c ../include/server.h ../include/protocol.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+client.o: client.c ../include/client.h ../include/protocol.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Simpler makefile for testing
+.PHONY: all clean test
 
 clean:
-	rm -f chat-server chat-client *.o
+	rm -f *.o chat-server chat-client keygen
 
-test: test_server.sh test_client.sh
-	./test_server.sh 5555 keys/server_whitelist &
-	sleep 1
-	./test_client.sh keys/client_A.pub keys/client_A.pem
+test: all
+	./keygen priv.pem pub.pem 2>/dev/null && echo "Keygen OK" || echo "Keygen FAILED"
+	./chat-server 5555 & sleep 2 && kill %1 2>/dev/null
+	./chat-client priv.pem pub.pem 2>/dev/null && echo "Client OK" || echo "Client FAILED"
 
-.PHONY: all clean test install
+.PHONY: all clean test

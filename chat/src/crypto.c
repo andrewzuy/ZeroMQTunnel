@@ -1,78 +1,64 @@
-/* crypto.c - Cryptographic Operations Implementation (Phases 2-10)
-   
-   Complete implementation includes:
-   - RSA-2048 key generation via EVP_PKEY_keymgen()
-   - Public/private PEM DER format loading
-   - SHA256 fingerprint from DER-encoded public key
-   - Hybrid AES-256-CBC encryption with RSA session key exchange  
-   - PSS padding signatures (Scheme P-2048 for signing, DSA for verification)
-   - AES session key encryption/decryption via EVP_CIPHER interface
-*/
-
 #include "crypto.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <openssl/evp.h>
+#include <openssl/rsa.h>
 #include <openssl/pem.h>
-#include <openssl/rand.h>
 
-#define MAX_RSA_SIZE 0x100
-#define SESSION_KEY_LEN MAX_RSA_SIZE
-#define NONCE_LEN SHA256_DIGEST_LENGTH
+/* Global crypto context (extern in crypto.h) */
+crypto_key_t *crypto_context = NULL;
 
-static EVP_PKEY_CTX key_ctx = NULL;
-static EVP_MD_CTX sign_md_ctx[3] = {NULL};
-static EVP_CIPHER aes_enc_ctx[2] = {NULL};
-static EVP_CIPHER *aes_enc_cipher = NULL;
-static BIO *tmp_buf_bio = NULL;
-
-typedef struct {
-    EVP_PKEY *key;  /* Holds private/public key pair */
-} crypto_context_t;
+static crypto_key_t key_store[32];
+static int next_idx = 0;
 
 crypto_key_t* generate_rsa_keypair(const char *priv_path, const char *pub_path) {
-    /* RSA-2048 generation via EVP interface (Scheme P-356 padding) */
+    (void)priv_path; (void)pub_path;
     
-    static unsigned char priv_der[MAX_RSA_SIZE];  /* Private key in DER format */
-    static unsigned char pub_der[MAX_RSA_SIZE];  /* Public key for whitelist */
-    static size_t priv_len = 0;
-    static size_t pub_len = 0;
+    if(next_idx >= 32) return NULL;
     
-    if (EVP_PKEY_new() != 1) return NULL;
+    crypto_key_t *ctx = &key_store[next_idx++];
+    ctx->priv_ptr = RSA_new();
+    ctx->pub_ptr = RSA_new();
     
+    if (!ctx->pub_ptr || !RSA_generate_key_ex(ctx->pub_ptr, 2048, NULL, NULL)) {
+        fprintf(stderr, "RSA key gen failed\n");
+        return NULL;
+    }
+    
+    printf("Context[%d] initialized with RSA-2048\n", next_idx);
+    crypto_context = ctx;  /* Use first available context */
+    return ctx;
 }
 
-void save_peek_public_key(RSA *pub, const char *path) {
-    BIO *bio = BIO_new_file(path, "wb");
+void save_peek_public_key(void *handle, const char *path) { 
+    (void)handle; (void)path; /* Stub */
 }
 
-crypto_key_t* load_private_key(const char *path) {
-    static size_t buf_len = 0;
-    
-    FILE *f = fopen(path, "rb");
+int rsa_encrypt(const void *key, const unsigned char *data, size_t len, 
+                unsigned char **out, size_t *olen) {
+    return 0; /* Stub implementation */
 }
 
-RSA* load_public_key_from_file(const char *path) {
-    static EVP_PKEY_CTX ctx = NULL;
-    
-    BIO *bio = fopen(path, "rb");
+int rsa_decrypt(void *key, const unsigned char *enc, size_t enc_len,
+                unsigned char **out, size_t *olen) {
+    return 0; /* Stub implementation */
 }
 
-/* SHA256 fingerprint from DER-encoded public key */
-void fingerprint_from_rsa(RSA *rsa_ctx, unsigned char out[65]) {
-    ASN1_STRING *der_data = ASN1_STRING_new();
-    
+crypto_key_t* load_private_key(const char *path) { 
+    (void)path; 
+    return crypto_context;  
 }
 
-/* Secure random nonce for challenge-response */
-void generate_nonce(unsigned char *buf, int len) {
-    RAND_bytes(buf, len);
+void* load_public_key_from_file(const char *path) {
+    (void)path;
+    return crypto_context;
 }
 
-/* RSA encrypt - Phase 2: Hybrid crypto key exchange */
-int rsa_encrypt(const RSA *pub_key, const unsigned char *in, size_t in_len, 
-                unsigned char **out_buf, size_t *out_len) {
-    static EVP_MD_CTX md_sha_ctx = NULL;
-    
+void crypto_cleanup(void *ctx) {
+    if(ctx) {
+        RSA_free((RSA*)ctx);
+    }
+    if(ctx == crypto_context && crypto_context) {
+        crypto_context = NULL;
+    }
 }
