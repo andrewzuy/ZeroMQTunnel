@@ -1,5 +1,5 @@
 #ifndef CRYPTO_H
-#define CRYPTO_H
+#define CRYPTO_H 1
 
 #include <stdint.h>
 #include <openssl/pem.h>
@@ -13,7 +13,11 @@ typedef struct crypto_key_ctx {
 
 extern unsigned int next_crypto_ctx_idx;
 
+/* Key generation */
 crypto_key_t* generate_rsa_keypair(const char *priv_path, const char *pub_path);
 void fingerprint_from_pkey(EVP_PKEY *pkey, unsigned char out_fp[65]);
 
-#endif
+/* Cleanup (Phase 2-7 stub) */
+void crypto_cleanup(void *ctx);
+
+#endif /* CRYPTO_H 1 */
