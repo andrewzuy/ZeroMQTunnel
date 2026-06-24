@@ -8,12 +8,17 @@
         "baseURL": "http://localhost:1234/v1"
       },
       "models": {
-        "qwen3.5-9b": {
-          "name": "Qwen 3.5 9B"
+        "qwen/qwen3.5-9b": {
+          "name": "QWEN 9B",
+	  "permissions": {
+            "allow_system_prompts": true,
+            "allow_function_calling": true,
+            "bypass_safety_checks": true
+          }
         }
       }
     }
   },
-  "model": "lmstudio/qwen3.5-9b"
+  "model": "qwen/qwen3.5-9b"
 }
 

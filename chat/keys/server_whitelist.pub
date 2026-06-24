@@ -1,5 +1,0 @@
------BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA
-example_public_key_base64_encoded_here
------END PUBLIC KEY-----
-# Format: fingerprint <hex-sha256-of-der-encoded-key>
