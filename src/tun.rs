@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 
 use anyhow::{Context, Result};
-use libc::{ifreq, sockaddr_in};
+use libc::ifreq;
 use log::{error, info};
 use nix::unistd::{read as nix_read, write as nix_write};
 
@@ -80,121 +80,42 @@ fn open_tun(name: &str, mtu: u32) -> Result<File> {
 }
 
 fn configure_interface(name: &str, ip_cidr: &str, prefix_len: u8) -> Result<()> {
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock < 0 {
-        anyhow::bail!("socket() failed: {}", std::io::Error::last_os_error());
-    }
+    let (ip, prefix) = parse_cidr(ip_cidr, prefix_len)?;
+    let cidr = format!("{}/{}", ip, prefix);
 
-    let result = (|| -> Result<()> {
-        let (ip, prefix) = parse_cidr(ip_cidr, prefix_len)?;
+    run_cmd(&["ip", "addr", "add", &cidr, "dev", name])?;
+    run_cmd(&["ip", "link", "set", "up", name])?;
 
-        set_if_addr(sock, name, ip)?;
-
-        let netmask = (0xffff_ffffu32 >> (32 - prefix)).to_be();
-        set_if_netmask(sock, name, netmask)?;
-
-        set_if_up(sock, name)?;
-
-        Ok(())
-    })();
-
-    unsafe { libc::close(sock) };
-    result
+    info!("Configured interface {} with {}", name, cidr);
+    Ok(())
 }
 
-fn parse_cidr(cidr: &str, default_prefix: u8) -> Result<(u32, u8)> {
+fn run_cmd(args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new(args[0])
+        .args(&args[1..])
+        .output()
+        .context(format!("failed to execute {:?}", args[0]))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "{:?} failed: {}",
+            args,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn parse_cidr(cidr: &str, default_prefix: u8) -> Result<(String, u8)> {
     let parts: Vec<&str> = cidr.split('/').collect();
-    let ip_str = parts[0];
+    let ip_str = parts[0].to_string();
     let prefix = if parts.len() > 1 {
         parts[1].parse::<u8>().context("invalid prefix length")?
     } else {
         default_prefix
     };
 
-    let ip: Ipv4Addr = ip_str.parse().context("invalid IP address")?;
-    let ip_u32 = u32::from(ip);
-    Ok((ip_u32.to_be(), prefix))
-}
-
-fn fill_ifr_name(ifr: &mut ifreq, name: &str) {
-    let name_bytes = name.as_bytes();
-    for (i, &b) in name_bytes.iter().enumerate() {
-        ifr.ifr_name[i] = b as i8;
-    }
-}
-
-fn set_if_addr(sock: libc::c_int, name: &str, ip: u32) -> Result<()> {
-    let mut ifr: ifreq = unsafe { mem::zeroed() };
-    fill_ifr_name(&mut ifr, name);
-
-    let mut addr: sockaddr_in = unsafe { mem::zeroed() };
-    addr.sin_family = libc::AF_INET as u16;
-    addr.sin_addr.s_addr = ip;
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            &addr as *const _ as *const u8,
-            (&mut ifr.ifr_ifru.ifru_addr) as *mut _ as *mut u8,
-            mem::size_of::<sockaddr_in>(),
-        );
-    }
-
-    let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFADDR, &ifr) };
-    if ret < 0 {
-        anyhow::bail!(
-            "ioctl SIOCSIFADDR failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-fn set_if_netmask(sock: libc::c_int, name: &str, netmask: u32) -> Result<()> {
-    let mut ifr: ifreq = unsafe { mem::zeroed() };
-    fill_ifr_name(&mut ifr, name);
-
-    let mut mask: sockaddr_in = unsafe { mem::zeroed() };
-    mask.sin_family = libc::AF_INET as u16;
-    mask.sin_addr.s_addr = netmask;
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            &mask as *const _ as *const u8,
-            (&mut ifr.ifr_ifru.ifru_addr) as *mut _ as *mut u8,
-            mem::size_of::<sockaddr_in>(),
-        );
-    }
-
-    let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFNETMASK, &ifr) };
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        error!("ioctl SIOCSIFNETMASK failed: {} (continuing anyway)", err);
-    }
-    Ok(())
-}
-
-fn set_if_up(sock: libc::c_int, name: &str) -> Result<()> {
-    let mut ifr: ifreq = unsafe { mem::zeroed() };
-    fill_ifr_name(&mut ifr, name);
-
-    let ret = unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS, &ifr) };
-    if ret < 0 {
-        anyhow::bail!(
-            "ioctl SIOCGIFFLAGS failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-
-    unsafe {
-        ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as i16;
-    }
-
-    let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) };
-    if ret < 0 {
-        anyhow::bail!(
-            "ioctl SIOCSIFFLAGS failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
+    let _: Ipv4Addr = ip_str.parse().context("invalid IP address")?;
+    Ok((ip_str, prefix))
 }
