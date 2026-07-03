@@ -1,4 +1,5 @@
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -67,6 +68,28 @@ async fn main() -> Result<()> {
     let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(64);
     let (zmq_tx, mut zmq_rx) = mpsc::channel::<Vec<u8>>(64);
 
+    let tun_to_zmq_count = Arc::new(AtomicU64::new(0));
+    let zmq_to_tun_count = Arc::new(AtomicU64::new(0));
+
+    let stats_tun_count = tun_to_zmq_count.clone();
+    let stats_zmq_count = zmq_to_tun_count.clone();
+    let mut stats_shutdown = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mode = mode_str;
+        loop {
+            tokio::select! {
+                _ = sleep(Duration::from_secs(1)) => {
+                    let sent = stats_tun_count.load(Ordering::Relaxed);
+                    let recv = stats_zmq_count.load(Ordering::Relaxed);
+                    eprintln!("[{mode}] tun->zmq: {sent} | zmq->tun: {recv}");
+                }
+                _ = stats_shutdown.recv() => {
+                    break;
+                }
+            }
+        }
+    });
+
     let tun_file = tun.file().try_clone()?;
     let tun_shutdown_sub = shutdown_tx.subscribe();
     tokio::spawn(async move {
@@ -98,6 +121,7 @@ async fn main() -> Result<()> {
         let mut shutdown_signal = shutdown_tx.subscribe();
         tokio::select! {
             Some(data) = tun_rx.recv() => {
+                tun_to_zmq_count.fetch_add(1, Ordering::Relaxed);
                 let sock = channel.socket_handle();
                 if let Err(e) = spawn_blocking(move || {
                     sock.lock().map_err(|e| format!("mutex poisoned: {}", e))
@@ -107,6 +131,7 @@ async fn main() -> Result<()> {
                 }
             }
             Some(data) = zmq_rx.recv() => {
+                zmq_to_tun_count.fetch_add(1, Ordering::Relaxed);
                 let file = tun_write_file.try_clone().unwrap_or_else(|e| {
                     error!("Failed to clone tun file: {}", e);
                     std::process::exit(1);
