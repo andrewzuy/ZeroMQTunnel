@@ -167,10 +167,8 @@ fn set_if_netmask(sock: libc::c_int, name: &str, netmask: u32) -> Result<()> {
 
     let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFNETMASK, &ifr) };
     if ret < 0 {
-        anyhow::bail!(
-            "ioctl SIOCSIFNETMASK failed: {}",
-            std::io::Error::last_os_error()
-        );
+        let err = std::io::Error::last_os_error();
+        error!("ioctl SIOCSIFNETMASK failed: {} (continuing anyway)", err);
     }
     Ok(())
 }
