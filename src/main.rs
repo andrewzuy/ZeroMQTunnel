@@ -122,16 +122,20 @@ async fn main() -> Result<()> {
         tokio::select! {
             Some(data) = tun_rx.recv() => {
                 tun_to_zmq_count.fetch_add(1, Ordering::Relaxed);
+                info!("[{}] tun->zmq sending {} bytes", mode_str, data.len());
                 let sock = channel.socket_handle();
                 if let Err(e) = spawn_blocking(move || {
                     sock.lock().map_err(|e| format!("mutex poisoned: {}", e))
                         .and_then(|s| s.send(&data, 0).map_err(|e| format!("zmq send error: {}", e)))
                 }).await {
                     error!("Forward TUN->ZMQ failed: {:?}", e);
+                } else {
+                    info!("[{}] tun->zmq sent ok", mode_str);
                 }
             }
             Some(data) = zmq_rx.recv() => {
                 zmq_to_tun_count.fetch_add(1, Ordering::Relaxed);
+                info!("[{}] zmq->tun received {} bytes from ZMQ", mode_str, data.len());
                 let file = tun_write_file.try_clone().unwrap_or_else(|e| {
                     error!("Failed to clone tun file: {}", e);
                     std::process::exit(1);
@@ -140,6 +144,8 @@ async fn main() -> Result<()> {
                     nix::unistd::write(&file, &data)
                 }).await {
                     warn!("Forward ZMQ->TUN failed: {:?}", e);
+                } else {
+                    info!("[{}] zmq->tun written ok", mode_str);
                 }
             }
             _ = tokio::signal::ctrl_c() => {
