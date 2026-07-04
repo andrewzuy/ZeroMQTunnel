@@ -246,11 +246,12 @@ async fn main() -> Result<()> {
     let tui_state = Arc::new(std::sync::Mutex::new(TuiState::new()));
 
     let tui_state_clone = tui_state.clone();
+    let tui_shutdown_tx = shutdown_tx.clone();
     let mut tui_shutdown = shutdown_tx.subscribe();
     let tui_mode = mode_str.to_string();
     let tui_addr = args.address.clone();
     tokio::spawn(async move {
-        run_tui(tui_state_clone, tui_mode, tui_addr, &mut tui_shutdown).await;
+        run_tui(tui_state_clone, tui_mode, tui_addr, tui_shutdown_tx, &mut tui_shutdown).await;
     });
 
     let tun_file = tun.file().try_clone()?;
@@ -350,13 +351,13 @@ async fn run_tui(
     state: Arc<std::sync::Mutex<TuiState>>,
     mode: String,
     address: String,
+    shutdown_tx: broadcast::Sender<()>,
     shutdown: &mut broadcast::Receiver<()>,
 ) {
     let mut stdout = std::io::stdout();
     crossterm::execute!(
         stdout,
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
+        crossterm::terminal::EnterAlternateScreen
     )
     .unwrap();
 
@@ -367,6 +368,19 @@ async fn run_tui(
     };
 
     loop {
+        // Check for keyboard input (non-blocking)
+        if crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
+            if let Ok(crossterm::event::Event::Key(key_event)) = crossterm::event::read() {
+                if key_event.kind == crossterm::event::KeyEventKind::Press
+                    && key_event.code == crossterm::event::KeyCode::Char('q')
+                    && key_event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                {
+                    let _ = shutdown_tx.send(());
+                    break;
+                }
+            }
+        }
+
         tokio::select! {
             _ = shutdown.recv() => {
                 break;
@@ -448,7 +462,7 @@ async fn run_tui(
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Press Ctrl+C to exit",
+                    "Press Ctrl+Q or Ctrl+C to exit",
                     Style::new().fg(Color::Gray),
                 )),
             ];
@@ -542,8 +556,7 @@ async fn run_tui(
     let _ = terminal.show_cursor();
     crossterm::execute!(
         std::io::stdout(),
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
+        crossterm::terminal::LeaveAlternateScreen
     )
     .unwrap();
 }
