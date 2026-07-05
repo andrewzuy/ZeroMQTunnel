@@ -279,11 +279,12 @@ async fn main() -> Result<()> {
     )
     .unwrap();
 
+    let mut shutdown_signal = shutdown_tx.subscribe();
+
     let tun_write_file = tun.file().try_clone()?;
     let main_tui_state = tui_state.clone();
 
     loop {
-        let mut shutdown_signal = shutdown_tx.subscribe();
         tokio::select! {
             Some(data) = tun_rx.recv() => {
                 let data_clone = data.clone();
@@ -586,11 +587,17 @@ async fn tun_reader_loop(
             }) => {
                 match result {
                     Ok(Ok(data)) => {
-                        if tx.send(data).await.is_err() {
-                            break;
+                        if !data.is_empty() {
+                            if tx.send(data).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Ok(Err(e)) => {
+                        if e == nix::Error::EAGAIN || e == nix::Error::EWOULDBLOCK {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            continue;
+                        }
                         error!("TUN read error: {}", e);
                         break;
                     }
@@ -635,6 +642,10 @@ async fn zmq_reader_loop(
                     }
                     Ok(Err(zmq::Error::ETERM)) => {
                         break;
+                    }
+                    Ok(Err(zmq::Error::EAGAIN)) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
                     }
                     Ok(Err(ref e)) => {
                         error!("ZMQ recv error: {}", e);

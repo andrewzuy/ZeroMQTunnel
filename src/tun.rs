@@ -6,6 +6,7 @@ use std::os::fd::AsRawFd;
 use anyhow::{Context, Result};
 use libc::ifreq;
 use log::{error, info};
+use nix::fcntl::{fcntl, FcntlArg::{F_GETFL, F_SETFL}, OFlag};
 use nix::unistd::{read as nix_read, write as nix_write};
 
 const TUNSETMTU: u64 = 0x400454D3;
@@ -74,6 +75,11 @@ fn open_tun(name: &str, mtu: u32) -> Result<File> {
         let err = std::io::Error::last_os_error();
         error!("ioctl TUNSETMTU failed: {} (continuing anyway)", err);
     }
+
+    // Set non-blocking to prevent read() from blocking the thread pool
+    let flags = fcntl(fd, F_GETFL)?;
+    let oflags = OFlag::from_bits_truncate(flags);
+    fcntl(fd, F_SETFL(oflags | OFlag::O_NONBLOCK))?;
 
     info!("Opened TUN device '{}'", name);
     Ok(file)

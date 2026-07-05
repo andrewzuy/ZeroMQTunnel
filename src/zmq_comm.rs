@@ -24,6 +24,12 @@ impl ZmqChannel {
         socket
             .set_rcvhwm(128)
             .context("failed to set ZMQ_RCVHWM")?;
+        socket
+            .set_rcvtimeo(100)
+            .context("failed to set ZMQ_RCVTIMEO")?;
+        socket
+            .set_sndtimeo(100)
+            .context("failed to set ZMQ_SNDTIMEO")?;
 
         match mode {
             "server" => {
