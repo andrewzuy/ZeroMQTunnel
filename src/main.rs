@@ -20,7 +20,7 @@ mod tun;
 mod zmq_comm;
 
 use tun::TunDevice;
-use zmq_comm::ZmqChannel;
+use zmq_comm::{ClientRegistry, ZmqChannel};
 
 #[derive(Parser)]
 #[command(name = "zmq_tun", about = "TUN-to-ZeroMQ bridge")]
@@ -39,6 +39,10 @@ struct Args {
 
     #[arg(long, default_value_t = 1500)]
     mtu: u32,
+
+    /// Client IP address (required for client mode, used for routing)
+    #[arg(long)]
+    client_ip: Option<String>,
 }
 
 #[derive(ValueEnum, Clone)]
@@ -66,6 +70,7 @@ struct TuiState {
     start_time: Instant,
     zmq_connected: bool,
     max_entries: usize,
+    client_count: AtomicU64,
 }
 
 impl TuiState {
@@ -77,7 +82,12 @@ impl TuiState {
             start_time: Instant::now(),
             zmq_connected: false,
             max_entries: 500,
+            client_count: AtomicU64::new(0),
         }
+    }
+
+    fn set_client_count(&mut self, count: usize) {
+        self.client_count.store(count as u64, Ordering::Relaxed);
     }
 
     fn add_entry(&mut self, direction: &str, data: &[u8], status: &str) {
@@ -236,7 +246,8 @@ async fn main() -> Result<()> {
     let tun = TunDevice::new(&args.tun_name, &ip, prefix_len, args.mtu)?;
 
     let zmq_ctx = zmq::Context::new();
-    let channel = ZmqChannel::new(&zmq_ctx, mode_str, &args.address)?;
+    let channel = ZmqChannel::new(&zmq_ctx, mode_str, &args.address, args.client_ip.as_deref())?;
+    let client_registry = channel.client_registry();
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -267,8 +278,9 @@ async fn main() -> Result<()> {
     let zmq_shutdown_sub = shutdown_tx.subscribe();
     let zmq_tui_state = tui_state.clone();
     let zmq_mode = mode_str.to_string();
+    let zmq_registry = client_registry.clone();
     tokio::spawn(async move {
-        if let Err(e) = zmq_reader_loop(zmq_socket_handle, zmq_shutdown_sub, zmq_tx, zmq_tui_state, &zmq_mode).await {
+        if let Err(e) = zmq_reader_loop(zmq_socket_handle, zmq_shutdown_sub, zmq_tx, zmq_tui_state, &zmq_mode, &zmq_registry).await {
             error!("ZMQ reader error: {}", e);
         }
         info!("ZMQ reader exited");
@@ -283,27 +295,57 @@ async fn main() -> Result<()> {
 
     let tun_write_file = tun.file().try_clone()?;
     let main_tui_state = tui_state.clone();
+    let main_registry = client_registry.clone();
+    let is_server = mode_str == "server";
 
     loop {
         tokio::select! {
             Some(data) = tun_rx.recv() => {
                 let data_clone = data.clone();
-                let sock = channel.socket_handle();
-                let result = spawn_blocking(move || {
-                    sock.lock().map_err(|e| format!("mutex poisoned: {}", e))
-                        .and_then(|s| s.send(&data, 0).map_err(|e| format!("zmq send error: {}", e)))
-                }).await;
 
-                let status = match result {
-                    Ok(Ok(())) => "OK",
-                    Ok(Err(ref e)) => {
-                        error!("Forward TUN->ZMQ failed: {:?}", e);
-                        "FAIL"
-                    }
-                    Err(_) => "CANCELLED",
-                };
+                if is_server {
+                    // Route to specific client based on destination IP
+                    let dst_ip = extract_dst_ip(&data);
+                    let registry = main_registry.clone();
+                    let chan = channel.clone();
+                    let result = spawn_blocking(move || {
+                        if let Some(identity) = registry.get_identity(&dst_ip) {
+                            chan.send_to_client(&identity, &data)
+                        } else {
+                            warn!("No client registered for IP {}, dropping packet", dst_ip);
+                            anyhow::Ok(())
+                        }
+                    }).await;
 
-                main_tui_state.lock().unwrap().add_entry("tun->zmq", &data_clone, status);
+                    let status = match result {
+                        Ok(Ok(())) => "OK",
+                        Ok(Err(ref e)) => {
+                            error!("Forward TUN->ZMQ failed: {:?}", e);
+                            "FAIL"
+                        }
+                        Err(_) => "CANCELLED",
+                    };
+
+                    main_tui_state.lock().unwrap().add_entry("tun->zmq", &data_clone, status);
+                } else {
+                    // Client mode: just send
+                    let sock = channel.socket_handle();
+                    let result = spawn_blocking(move || {
+                        sock.lock().map_err(|e| format!("mutex poisoned: {}", e))
+                            .and_then(|s| s.send(&data, 0).map_err(|e| format!("zmq send error: {}", e)))
+                    }).await;
+
+                    let status = match result {
+                        Ok(Ok(())) => "OK",
+                        Ok(Err(ref e)) => {
+                            error!("Forward TUN->ZMQ failed: {:?}", e);
+                            "FAIL"
+                        }
+                        Err(_) => "CANCELLED",
+                    };
+
+                    main_tui_state.lock().unwrap().add_entry("tun->zmq", &data_clone, status);
+                }
             }
             Some(data) = zmq_rx.recv() => {
                 let data_clone = data.clone();
@@ -400,7 +442,7 @@ async fn run_tui(
         terminal.draw(|f| {
             let size = f.area();
 
-            let upper_height = 8;
+            let upper_height = 9;
             let chunks = Layout::vertical([
                 Constraint::Length(upper_height),
                 Constraint::Min(1),
@@ -426,6 +468,10 @@ async fn run_tui(
                 Line::from(Span::styled(
                     format!("Uptime: {}", uptime),
                     Style::new().fg(Color::Green),
+                )),
+                Line::from(Span::styled(
+                    format!("Connected clients: {}", state.lock().unwrap().client_count.load(Ordering::Relaxed)),
+                    Style::new().fg(Color::Cyan).bold(),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -619,21 +665,50 @@ async fn zmq_reader_loop(
     mut shutdown_rx: broadcast::Receiver<()>,
     tx: mpsc::Sender<Vec<u8>>,
     tui_state: Arc<std::sync::Mutex<TuiState>>,
-    _mode: &str,
+    mode: &str,
+    registry: &ClientRegistry,
 ) -> Result<()> {
     loop {
         tokio::select! {
             result = spawn_blocking({
                 let sock = socket.clone();
                 move || {
-                    let msg = sock.lock()
+                    sock.lock()
                         .map_err(|_e| zmq::Error::EHOSTUNREACH)
-                        .and_then(|s| s.recv_bytes(0));
-                    msg
+                        .and_then(|s| {
+                            // ROUTER framing: [identity] [empty delimiter] [data ...]
+                            let id_msg = s.recv_msg(0)?;
+                            let identity = String::from_utf8_lossy(&*id_msg).to_string();
+
+                            let delim_msg = s.recv_msg(0)?;
+                            if !delim_msg.is_empty() {
+                                // No empty delimiter — this is actually the data frame
+                                let data = (*delim_msg).to_vec();
+                                return Ok((identity, data));
+                            }
+
+                            let data_msg = s.recv_msg(0)?;
+                            let data = (*data_msg).to_vec();
+
+                            Ok((identity, data))
+                        })
                 }
             }) => {
                 match result {
-                    Ok(Ok(data)) => {
+                    Ok(Ok((identity, data))) => {
+                        // Check for client registration
+                        if mode == "server" {
+                            if let Some(client_ip) = ZmqChannel::check_registration(&data) {
+                                registry.register(&identity, &client_ip);
+                                let count = registry.len();
+                                info!("{} clients connected", count);
+                                if let Ok(mut state) = tui_state.lock() {
+                                    state.set_client_count(count);
+                                }
+                                continue;
+                            }
+                        }
+
                         let status = "RECV";
                         tui_state.lock().unwrap().add_entry("zmq_recv", &data, status);
                         if tx.send(data).await.is_err() {
@@ -644,7 +719,7 @@ async fn zmq_reader_loop(
                         break;
                     }
                     Ok(Err(zmq::Error::EAGAIN)) => {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                         continue;
                     }
                     Ok(Err(ref e)) => {
@@ -662,6 +737,14 @@ async fn zmq_reader_loop(
         }
     }
     Ok(())
+}
+
+fn extract_dst_ip(data: &[u8]) -> String {
+    if data.len() >= 20 && (data[0] >> 4) == 4 {
+        format!("{}.{}.{}.{}", data[16], data[17], data[18], data[19])
+    } else {
+        "?".into()
+    }
 }
 
 fn parse_ip_cidr(cidr: &str) -> Result<(String, u8)> {

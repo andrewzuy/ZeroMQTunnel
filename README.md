@@ -23,17 +23,17 @@
 
 ## 1. Introduction
 
-`zmq_tun` is a lightweight, bidirectional network tunnel written in Rust. It creates a virtual network interface on Linux using the TUN device, then forwards raw IP packets between that interface and a remote peer over a ZeroMQ PAIR socket connected via TCP.
+`zmq_tun` is a lightweight, bidirectional network tunnel written in Rust. It creates a virtual network interface on Linux using the TUN device, then forwards raw IP packets between that interface and remote peers over ZeroMQ ROUTER/DEALER sockets connected via TCP.
 
-Think of it as a point-to-point virtual cable: two machines, each running `zmq_tun`, can exchange arbitrary IP traffic as if they were connected by a physical wire — even across the internet.
+The server uses a ROUTER socket to multiplex connections from multiple clients, each using a DEALER socket. A client registry maps ZMQ identities to client IPs, enabling the server to route return traffic to the correct peer.
 
 ### What problem does it solve?
 
-Traditional VPN solutions are heavy, require complex configuration, and often introduce unnecessary overhead. `zmq_tun` takes a different approach: it leverages ZeroMQ's reliable messaging fabric as a transport layer, and Rust's async runtime to keep the forwarding path fast and simple.
+Traditional VPN solutions are heavy, require complex configuration, and often introduce unnecessary overhead. `zmq_tun` takes a different approach: it leverages ZeroMQ's reliable messaging fabric as a transport layer, and Rust's async runtime to keep the forwarding path fast and simple. The ROUTER/DEALER socket pattern enables a single server to serve multiple clients, with automatic packet routing based on destination IP.
 
 ### Typical use cases
 
-- **Custom overlay networks** between two hosts in a lab environment
+- **Custom overlay networks** between multiple hosts in a lab environment
 - **Network traffic analysis** — the built-in TUI logs every packet in Wireshark-style format
 - **Tunneling IP traffic** through a messaging infrastructure
 - **Prototyping** isolated network segments without physical hardware
@@ -43,7 +43,7 @@ Traditional VPN solutions are heavy, require complex configuration, and often in
 ## 2. Architecture at a Glance
 
 ```
-+----------------------+     ZeroMQ PAIR      +----------------------+
++----------------------+     ZeroMQ ROUTER      +----------------------+
 |     Machine A        |  <--------------->   |     Machine B        |
 |   (Server Mode)      |   tcp://addr:port    |   (Client Mode)      |
 |                      |                      |                      |
@@ -54,7 +54,7 @@ Traditional VPN solutions are heavy, require complex configuration, and often in
 |  +-------+--------+  |                      |  +-------+--------+  |
 |          |           |                      |          |           |
 |   +------v------+    |                      |   +------v------+    |
-|   | TUN Reader   |    |                      |   | ZMQ Reader   |    |
+|   | TUN Reader   |    |                      |   | TUN Reader   |    |
 |   | (blocking)   |    |                      |   | (blocking)   |    |
 |   +------+------ +    |                      |   +------+------ +    |
 |          |           |                      |          |           |
@@ -65,14 +65,15 @@ Traditional VPN solutions are heavy, require complex configuration, and often in
 |   +------v------+    |                      |   +------v------+    |
 |   |  Main Loop   |<---+----->+              |   |  Main Loop   |    |
 |   |  (tokio)     |    |    |   |              |   |  (tokio)     |    |
-|   +------+------ +    |    |   +--------------+---+------+------ +    |
+|   |  +Registry   |    |    |   +--------------+---+------+------ +    |
+|   +------+------ +    |    |                      |          |        |
 |          |            |    |                      |          |        |
 |   +------v------+    |    |                      |   +------v------+  |
 |   | ZMQ Writer   |    |    |                      |   | TUN Writer   |  |
 |   +------+------ +    |    |                      |   +------+------ +  |
 |          |            |    |                      |          |          |
 |   +------v------+    |    |                      |   +------v------+  |
-|   | ZMQ Reader   |    |    |                      |   | TUN Reader   |  |
+|   | ZMQ Reader   |    |    |                      |   | ZMQ Reader   |  |
 |   | (blocking)   |    |    |                      |   | (blocking)   |  |
 |   +------+------ +    |    |                      |   +------+------ +  |
 |          |            |    |                      |          |          |
@@ -80,10 +81,10 @@ Traditional VPN solutions are heavy, require complex configuration, and often in
 |   |  mpsc ch     |    |    |                      |   |  mpsc ch     |  |
 |   +-------------+     |    |                      |   +-------------+  |
 +-----------------------+    |                      +-------------------+
-                             |
-              +--------------+--------------+
-              |  TCP Network (Internet, LAN)|
-              +-----------------------------+
+                              |
+               +--------------+--------------+
+               |  TCP Network (Internet, LAN)|
+               +-----------------------------+
 ```
 
 ### Data flow in words
@@ -91,8 +92,8 @@ Traditional VPN solutions are heavy, require complex configuration, and often in
 The application runs four concurrent I/O paths, all coordinated by a central async event loop:
 
 1. **TUN Reader** — A blocking task reads raw IP packets from the TUN device file descriptor and sends them through a `tokio::sync::mpsc` channel.
-2. **ZMQ Reader** — A blocking task receives messages from the ZeroMQ socket and sends them through a separate `mpsc` channel.
-3. **Main Loop** — The central `tokio::select!` loop receives from both channels. Packets arriving from TUN are forwarded to the remote peer via ZeroMQ. Packets arriving from ZeroMQ are written to the local TUN device.
+2. **ZMQ Reader** — A blocking task receives messages from the ZeroMQ socket and sends them through a separate `mpsc` channel. On the server side, it parses the 3-frame ROUTER envelope (`[identity][delimiter][data]`) to extract the sender's identity and the packet payload.
+3. **Main Loop** — The central `tokio::select!` loop receives from both channels. On the client side, packets from TUN are sent directly to the ZMQ DEALER socket. On the server side, packets from TUN are routed by destination IP using the `ClientRegistry`, which maps client IPs to their ZMQ identities. Packets arriving from ZeroMQ are written to the local TUN device.
 4. **TUI Task** — A separate task renders a live terminal dashboard showing packet statistics and a Wireshark-style packet log.
 
 This design decouples I/O sources from forwarding logic, keeping the async loop clean and responsive.
@@ -119,8 +120,8 @@ Tokio is the async runtime that powers the entire application. It provides:
 The `zmq` crate provides safe Rust bindings to the ZeroMQ messaging library (libzmq). It is responsible for:
 
 - Creating a **ZMQ context** — the top-level object that manages all sockets.
-- Creating a **PAIR socket** — a reliable, bidirectional, one-to-one socket type ideal for point-to-point tunneling.
-- Configuring socket options: `ZMQ_LINGER` (0, for immediate shutdown), `ZMQ_MAXMSGSIZE` (65536, to accommodate jumbo frames), `ZMQ_SNDHWM` and `ZMQ_RCVHWM` (128 each, to bound queue sizes), and `ZMQ_RCVTIMEO`/`ZMQ_SNDTIMEO` (100ms, for non-blocking behavior).
+- Creating a **ROUTER socket** (server) or **DEALER socket** (client) — the ROUTER/DEALER pattern enables multi-client support with message routing via client identities.
+- Configuring socket options: `ZMQ_LINGER` (0, for immediate shutdown), `ZMQ_MAXMSGSIZE` (65536, to accommodate jumbo frames), `ZMQ_SNDHWM` and `ZMQ_RCVHWM` (1024 each, to bound queue sizes), and `ZMQ_RCVTIMEO`/`ZMQ_SNDTIMEO` (100ms, for non-blocking behavior).
 - Binding (server mode) or connecting (client mode) to a TCP endpoint.
 
 The socket is wrapped in `Arc<Mutex<ZmqSocket>>` to allow safe sharing across multiple async tasks.
@@ -218,15 +219,29 @@ This struct holds the open file descriptor and the interface name. When dropped,
 
 ## 5. ZeroMQ Communication Layer
 
-**File:** `src/zmq_comm.rs` (80 lines)
+**File:** `src/zmq_comm.rs` (201 lines)
 
-### The PAIR socket model
+### The ROUTER/DEALER socket model
 
-ZeroMQ offers many socket types (PUB/SUB, REQ/REP, PUSH/PULL, etc.). The PAIR socket is chosen for this application because it provides:
+ZeroMQ offers many socket types (PUB/SUB, REQ/REP, PUSH/PULL, etc.). The ROUTER/DEALER pattern is used here because it provides:
 
 - **Bidirectional** communication — both peers can send and receive.
 - **Ordered delivery** — messages arrive in the order they were sent.
-- **One-to-one** semantics — exactly two peers, matching the point-to-point tunnel topology.
+- **Multi-client** support — a single ROUTER socket on the server can multiplex connections from many DEALER clients, routing messages by client identity.
+
+### ROUTER message framing
+
+Messages from the server's ROUTER socket to clients use a 3-frame envelope:
+
+```
+[Frame 1: client identity] [Frame 2: empty delimiter] [Frame 3: packet data]
+```
+
+The empty delimiter frame is mandatory for ROUTER sockets. The `send_to_client()` function sends all three frames. The `zmq_reader_loop` on the server parses incoming 3-frame messages to extract the sender's identity and the packet payload.
+
+### Client registration
+
+When a client connects, it sends a registration message prefixed with `0xFE` followed by its IP address. The server's `ClientRegistry` maps the client's ZMQ identity to its IP address, enabling return-traffic routing.
 
 ### Socket configuration
 
@@ -234,15 +249,15 @@ ZeroMQ offers many socket types (PUB/SUB, REQ/REP, PUSH/PULL, etc.). The PAIR so
 |--------|-------|---------|
 | `ZMQ_LINGER` | 0 | On shutdown, discard pending messages immediately rather than waiting. |
 | `ZMQ_MAXMSGSIZE` | 65536 | Maximum message size. Accommodates jumbo frames (up to 64KB). |
-| `ZMQ_SNDHWM` | 128 | High-water mark for outbound queue. Drops messages if queue exceeds 128. |
-| `ZMQ_RCVHWM` | 128 | High-water mark for inbound queue. Same backpressure mechanism. |
+| `ZMQ_SNDHWM` | 1024 | High-water mark for outbound queue. Drops messages if queue exceeds 1024. |
+| `ZMQ_RCVHWM` | 1024 | High-water mark for inbound queue. Same backpressure mechanism. |
 | `ZMQ_RCVTIMEO` | 100ms | Receive timeout. Prevents indefinite blocking on `recv()`. |
 | `ZMQ_SNDTIMEO` | 100ms | Send timeout. Prevents indefinite blocking on `send()`. |
 
 ### Server vs. client mode
 
-- **Server**: Calls `socket.bind(address)` to listen on the specified TCP endpoint.
-- **Client**: Calls `socket.connect(address)` to connect to the server.
+- **Server**: Calls `socket.bind(address)` to listen on the specified TCP endpoint. Sets `ZMQ_IMMEDIATE` to require peer identity before connecting.
+- **Client**: Calls `socket.set_identity()` with its IP address, then `socket.connect(address)` to connect to the server.
 
 The socket is wrapped in `Arc<Mutex<ZmqSocket>>` to allow safe concurrent access from multiple async tasks. The `Arc` provides reference counting (the socket stays alive as long as any task holds a reference), and the `Mutex` ensures only one task accesses the socket at a time.
 
@@ -250,7 +265,7 @@ The socket is wrapped in `Arc<Mutex<ZmqSocket>>` to allow safe concurrent access
 
 ## 6. The Async Event Loop
 
-**File:** `src/main.rs` (lines 218–349)
+**File:** `src/main.rs`
 
 The main function orchestrates the entire application. Here is the startup sequence:
 
@@ -260,7 +275,7 @@ The main function orchestrates the entire application. Here is the startup seque
 2. **CLI parsing** — `clap` parses command-line arguments into the `Args` struct.
 3. **CIDR parsing** — The IP address string (e.g., `"10.0.0.1/24"`) is split into IP and prefix length.
 4. **TUN creation** — `TunDevice::new()` opens and configures the virtual interface.
-5. **ZMQ setup** — A ZMQ context and PAIR socket are created and configured.
+5. **ZMQ setup** — A ZMQ context and ROUTER/DEALER socket are created and configured via `ZmqChannel::new()`.
 6. **Channel creation** — Two `mpsc` channels are created:
    - `tun_tx`/`tun_rx`: carries packets from TUN reader to the main loop.
    - `zmq_tx`/`zmq_rx`: carries packets from ZMQ reader to the main loop.
@@ -268,19 +283,19 @@ The main function orchestrates the entire application. Here is the startup seque
 
 ### Phase 2: Task spawning
 
-Four tasks are spawned:
+Three tasks are spawned:
 
-| Task | Reader | Purpose |
+| Task | Writer | Purpose |
 |------|--------|---------|
 | TUI Task | No | Renders the live dashboard. Subscribes to shutdown broadcast. |
 | TUN Reader | `tun_tx` | Reads packets from TUN device, sends to main loop via `mpsc`. |
-| ZMQ Reader | `zmq_tx` | Receives packets from ZMQ socket, sends to main loop via `mpsc`. |
+| ZMQ Reader | `zmq_tx` | Receives packets from ZMQ socket, sends to main loop via `mpsc`. On the server, parses the 3-frame ROUTER envelope. |
 
 Both reader tasks use `spawn_blocking` to offload blocking syscalls to tokio's blocking thread pool. Each task loops inside a `tokio::select!` that races the I/O operation against the shutdown broadcast.
 
 ### Phase 3: The forwarding loop
 
-The main `tokio::select!` loop multiplexes five events:
+The main `tokio::select!` loop multiplexes events:
 
 ```
 tokio::select! {
@@ -293,7 +308,9 @@ tokio::select! {
 }
 ```
 
-When a packet arrives from the TUN reader, it is sent to the remote peer via ZeroMQ. When a packet arrives from the ZMQ reader, it is written to the local TUN device. Both forwarding paths use `spawn_blocking` to avoid blocking the async executor.
+**Client side:** Packets from TUN are sent directly to the ZMQ DEALER socket. Packets from ZMQ are written to the local TUN device.
+
+**Server side:** Packets from TUN have their destination IP extracted and are routed via `send_to_client()` using the `ClientRegistry` to look up the target client's ZMQ identity. Registration messages (`0xFE` prefix) from ZMQ are used to update the client registry. All other packets from ZMQ are written to the local TUN device.
 
 Each forwarded packet is logged to the TUI state, recording direction, parsed IP headers, protocol, length, and status.
 
@@ -499,21 +516,21 @@ ss -tlnp | grep 5555
 ### Current limitations
 
 - **Linux-only** — relies on Linux-specific TUN/TAP ioctls.
-- **Point-to-point only** — ZMQ PAIR socket supports exactly two peers.
 - **No encryption** — traffic is sent in plaintext over TCP.
 - **No authentication** — any client can connect to a listening server.
 - **IPv4 only** — no IPv6 support.
 - **Requires root** — TUN interface creation needs elevated privileges.
+- **No client disconnect detection** — disconnected clients remain in the registry.
 
 ### Planned enhancements
 
-- **Multiple clients** — switch to ROUTER/DEALER socket pattern for multiplexing.
 - **Encryption** — add ZMQ CURVE or TLS support.
 - **IPv6** — extend TUN configuration for dual-stack operation.
 - **Configuration files** — TOML/YAML-based configuration.
 - **Metrics** — Prometheus exporter for packet counts, latency, and error rates.
 - **Non-root operation** — use Linux user namespaces for privilege reduction.
 - **Packet compression** — optional compression for low-bandwidth links.
+- **Client disconnect detection** — heartbeat or ZMQ monitoring to clean up stale registry entries.
 
 ---
 
