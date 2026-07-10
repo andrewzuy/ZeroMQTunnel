@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use log::info;
 use zmq::{Context as ZmqContext, Socket as ZmqSocket, SocketType};
 
+use crate::curve::CurveConfig;
+
 /// Magic byte prefix for client registration messages.
 pub const REGISTRATION_PREFIX: u8 = 0xFE;
 
@@ -60,6 +62,7 @@ pub struct ZmqChannel {
     mode: String,
     client_ip: Option<String>,
     client_registry: ClientRegistry,
+    curve_enabled: bool,
 }
 
 impl Clone for ZmqChannel {
@@ -69,12 +72,19 @@ impl Clone for ZmqChannel {
             mode: self.mode.clone(),
             client_ip: self.client_ip.clone(),
             client_registry: self.client_registry.clone(),
+            curve_enabled: self.curve_enabled,
         }
     }
 }
 
 impl ZmqChannel {
-    pub fn new(ctx: &ZmqContext, mode: &str, address: &str, client_ip: Option<&str>) -> Result<Self> {
+    pub fn new(
+        ctx: &ZmqContext,
+        mode: &str,
+        address: &str,
+        client_ip: Option<&str>,
+        curve_config: Option<&CurveConfig>,
+    ) -> Result<Self> {
         let socket_type = if mode == "server" { SocketType::ROUTER } else { SocketType::DEALER };
         let socket = ctx
             .socket(socket_type)
@@ -97,6 +107,10 @@ impl ZmqChannel {
             .set_sndtimeo(100)
             .context("failed to set ZMQ_SNDTIMEO")?;
 
+        if let Some(config) = curve_config {
+            apply_curve(&socket, mode, config).context("failed to configure ZMQ CURVE")?;
+        }
+
         if mode == "server" {
             socket.set_immediate(true).context("failed to set ZMQ_IMMEDIATE")?;
             socket
@@ -118,6 +132,7 @@ impl ZmqChannel {
             mode: mode.to_string(),
             client_ip: client_ip.map(|s| s.to_string()),
             client_registry: ClientRegistry::new(),
+            curve_enabled: curve_config.is_some(),
         };
 
         if mode == "client" {
@@ -202,4 +217,25 @@ impl ZmqChannel {
         }
         None
     }
+}
+
+fn apply_curve(socket: &ZmqSocket, mode: &str, config: &CurveConfig) -> Result<()> {
+    socket.set_curve_server(true).context("failed to set ZMQ_CURVE_SERVER")?;
+    socket
+        .set_curve_publickey(&config.own_keys.public_key)
+        .context("failed to set ZMQ_CURVE_PUBLICKEY")?;
+    socket
+        .set_curve_secretkey(&config.own_keys.secret_key)
+        .context("failed to set ZMQ_CURVE_SECRETKEY")?;
+
+    if mode != "server" {
+        if let Some(ref server_pk) = config.server_public_key {
+            socket
+                .set_curve_serverkey(server_pk)
+                .context("failed to set ZMQ_CURVE_SERVERKEY")?;
+        }
+    }
+
+    info!("ZMQ CURVE encryption enabled ({})", mode);
+    Ok(())
 }

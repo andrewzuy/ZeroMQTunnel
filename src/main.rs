@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use log::{error, info, warn};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -16,15 +16,31 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::spawn_blocking;
 use tokio::time::{sleep, Duration};
 
+mod curve;
 mod tun;
 mod zmq_comm;
 
+use curve::{CurveConfig, CurveKeys};
 use tun::TunDevice;
 use zmq_comm::{ClientRegistry, ZmqChannel};
 
 #[derive(Parser)]
 #[command(name = "zmq_tun", about = "TUN-to-ZeroMQ bridge")]
 struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run as server or client
+    Run(RunArgs),
+    /// Generate a CURVE key pair and print to stdout
+    Keygen(KeygenArgs),
+}
+
+#[derive(Parser)]
+struct RunArgs {
     #[arg(short, long, value_enum)]
     mode: Mode,
 
@@ -43,6 +59,25 @@ struct Args {
     /// Client IP address (required for client mode, used for routing)
     #[arg(long)]
     client_ip: Option<String>,
+
+    /// Enable ZMQ CURVE encryption
+    #[arg(long)]
+    enable_curve: bool,
+
+    /// Path to own CURVE key file (Z85-encoded, two lines: public, secret)
+    #[arg(long)]
+    curve_key_file: Option<String>,
+
+    /// Server's public key in Z85 format (required for client + curve)
+    #[arg(long)]
+    server_public_key: Option<String>,
+}
+
+#[derive(Parser)]
+struct KeygenArgs {
+    /// Output file path (prints to stdout if omitted)
+    #[arg(short, long)]
+    output: Option<String>,
 }
 
 #[derive(ValueEnum, Clone)]
@@ -231,22 +266,61 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    match args.command {
+        Command::Keygen(keygen_args) => {
+            run_keygen(keygen_args)?;
+            return Ok(());
+        }
+        Command::Run(run_args) => {
+            run_tunnel(run_args).await?;
+            return Ok(());
+        }
+    }
+}
+
+fn run_keygen(args: KeygenArgs) -> Result<()> {
+    let keys = CurveKeys::generate().context("failed to generate keys")?;
+    keys.print();
+    if let Some(output) = args.output {
+        keys.save_to_file(&output)?;
+    }
+    Ok(())
+}
+
+async fn run_tunnel(args: RunArgs) -> Result<()> {
     let mode_str = match args.mode {
         Mode::Server => "server",
         Mode::Client => "client",
     };
 
     info!(
-        "Starting zmq_tun: mode={}, address={}, tun={}, ip={}, mtu={}",
-        mode_str, args.address, args.tun_name, args.ip, args.mtu
+        "Starting zmq_tun: mode={}, address={}, tun={}, ip={}, mtu={}, curve={}",
+        mode_str, args.address, args.tun_name, args.ip, args.mtu, args.enable_curve
     );
+
+    let curve_config = if mode_str == "server" {
+        CurveConfig::for_server(args.enable_curve, args.curve_key_file.as_deref())?
+    } else {
+        CurveConfig::for_client(
+            args.enable_curve,
+            args.curve_key_file.as_deref(),
+            args.server_public_key.as_deref(),
+        )?
+    };
 
     let (ip, prefix_len) = parse_ip_cidr(&args.ip)?;
 
     let tun = TunDevice::new(&args.tun_name, &ip, prefix_len, args.mtu)?;
 
     let zmq_ctx = zmq::Context::new();
-    let channel = ZmqChannel::new(&zmq_ctx, mode_str, &args.address, args.client_ip.as_deref())?;
+    let channel = ZmqChannel::new(
+        &zmq_ctx,
+        mode_str,
+        &args.address,
+        args.client_ip.as_deref(),
+        curve_config.as_ref(),
+    )?;
     let client_registry = channel.client_registry();
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -261,8 +335,9 @@ async fn main() -> Result<()> {
     let mut tui_shutdown = shutdown_tx.subscribe();
     let tui_mode = mode_str.to_string();
     let tui_addr = args.address.clone();
+    let tui_curve = args.enable_curve;
     tokio::spawn(async move {
-        run_tui(tui_state_clone, tui_mode, tui_addr, tui_shutdown_tx, &mut tui_shutdown).await;
+        run_tui(tui_state_clone, tui_mode, tui_addr, tui_curve, tui_shutdown_tx, &mut tui_shutdown).await;
     });
 
     let tun_file = tun.file().try_clone()?;
@@ -394,6 +469,7 @@ async fn run_tui(
     state: Arc<std::sync::Mutex<TuiState>>,
     mode: String,
     address: String,
+    curve_enabled: bool,
     shutdown_tx: broadcast::Sender<()>,
     shutdown: &mut broadcast::Receiver<()>,
 ) {
@@ -506,6 +582,16 @@ async fn run_tui(
                 Line::from(Span::styled(
                     "Connection: ACTIVE",
                     Style::new().fg(Color::Green).bold(),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!(
+                        "CURVE encryption: {}",
+                        if curve_enabled { "ENABLED" } else { "DISABLED" }
+                    ),
+                    Style::new()
+                        .fg(if curve_enabled { Color::Green } else { Color::Yellow })
+                        .bold(),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
