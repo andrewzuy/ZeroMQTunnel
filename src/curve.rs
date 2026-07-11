@@ -2,7 +2,8 @@ use std::fs;
 
 use anyhow::{Context, Result};
 use log::info;
-use zmq::CurveKeyPair;
+use rand::rngs::OsRng;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Z85-encoded CURVE key pair for persistence.
 #[derive(Clone)]
@@ -14,18 +15,23 @@ pub struct CurveKeys {
 }
 
 impl CurveKeys {
-    /// Generate a new CURVE key pair.
+    /// Generate a new CURVE key pair using pure Rust (x25519).
     pub fn generate() -> Result<Self> {
-        let pair = CurveKeyPair::new().context("failed to generate CURVE key pair")?;
-        let public_z85 = zmq::z85_encode(&pair.public_key)
+        let secret_key = StaticSecret::random_from_rng(OsRng);
+        let public_key = PublicKey::from(&secret_key);
+
+        let public_key = public_key.to_bytes();
+        let secret_key = secret_key.to_bytes();
+
+        let public_z85 = zmq::z85_encode(&public_key)
             .context("failed to encode public key")?;
-        let secret_z85 = zmq::z85_encode(&pair.secret_key)
+        let secret_z85 = zmq::z85_encode(&secret_key)
             .context("failed to encode secret key")?;
         Ok(Self {
             public_key_z85: public_z85,
             secret_key_z85: secret_z85,
-            public_key: pair.public_key,
-            secret_key: pair.secret_key,
+            public_key,
+            secret_key,
         })
     }
 
