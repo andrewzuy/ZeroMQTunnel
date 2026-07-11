@@ -25,7 +25,17 @@ use tun::TunDevice;
 use zmq_comm::{ClientRegistry, ZmqChannel};
 
 #[derive(Parser)]
-#[command(name = "zmq_tun", about = "TUN-to-ZeroMQ bridge")]
+#[command(name = "zmq_tun", about = "TUN-to-ZeroMQ bridge", long_about = "Linux TUN-to-ZeroMQ bridge that forwards IP packets between a TUN interface and a ZeroMQ ROUTER/DEALER socket pair.
+
+Examples:
+  # Generate CURVE keys
+  zmq_tun keygen -o server.key
+
+  # Start server
+  sudo zmq_tun run --mode server --enable-curve --curve-key-file server.key
+
+  # Start client
+  sudo zmq_tun run --mode client --enable-curve --server-public-key <server-public-key> --client-ip 10.0.0.2")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -34,25 +44,38 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     /// Run as server or client
+    #[command(
+        about = "Run as server or client",
+        long_about = "Run the TUN-to-ZeroMQ bridge in server or client mode.\n\nExamples:\n  # Server without encryption\n  sudo zmq_tun run --mode server\n\n  # Server with CURVE encryption\n  sudo zmq_tun run --mode server --enable-curve --curve-key-file server.key\n\n  # Client with CURVE encryption\n  sudo zmq_tun run --mode client --enable-curve --server-public-key <key> --client-ip 10.0.0.2"
+    )]
     Run(RunArgs),
     /// Generate a CURVE key pair and print to stdout
+    #[command(
+        about = "Generate a CURVE key pair and print to stdout",
+        long_about = "Generate a CURVE key pair using pure Rust (x25519) and print to stdout.\n\nExamples:\n  # Print to stdout\n  zmq_tun keygen\n\n  # Save to file\n  zmq_tun keygen -o server.key"
+    )]
     Keygen(KeygenArgs),
 }
 
 #[derive(Parser)]
 struct RunArgs {
+    /// Run mode
     #[arg(short, long, value_enum)]
     mode: Mode,
 
+    /// Listen/connect address
     #[arg(short, long, default_value = "tcp://0.0.0.0:5555")]
     address: String,
 
+    /// TUN interface name
     #[arg(short, long, default_value = "tun0")]
     tun_name: String,
 
+    /// TUN interface IP with prefix (e.g. 10.0.0.1/24)
     #[arg(long, default_value = "10.0.0.1/24")]
     ip: String,
 
+    /// TUN interface MTU
     #[arg(long, default_value_t = 1500)]
     mtu: u32,
 
