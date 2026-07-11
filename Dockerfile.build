@@ -1,0 +1,29 @@
+# Start directly from Ubuntu 20.04 to guarantee GLIBC 2.31
+FROM ubuntu:20.04
+
+# Avoid interactive timezone prompts during installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install core build tools, curl, and native ZeroMQ dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    pkg-config \
+    libzmq3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the latest stable Rust using sh.rustup.rs (CRITICAL: note the 'sh.')
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Prepare the build directory
+WORKDIR /usr/src/myapp
+
+# Copy project files
+COPY . .
+
+# Build with release profile
+RUN cargo build --release
+
+# Create legacy_gcc output directory and copy binary
+RUN mkdir -p target/legacy_gcc && cp target/release/zmq_tun target/legacy_gcc/
