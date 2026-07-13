@@ -1,6 +1,6 @@
 # ZeroMQ Tunnel
 
-A lightweight Linux TUN-to-ZeroMQ bridge that forwards IP packets between a virtual network interface and a ZeroMQ socket. Connect remote machines over any network using a server-client architecture with optional CURVE encryption.
+A lightweight Linux TUN-to-ZeroMQ bridge that forwards IP packets between a virtual network interface and a ZeroMQ socket. Connect remote machines over any network using a server-client architecture with AES-256-CBC encryption.
 
 ## Quick Start
 
@@ -32,103 +32,40 @@ cargo build --release
 
 The binary is at `target/release/zmq_tun`.
 
-### Run (no encryption)
+### Run
 
 ```bash
 # Server
-sudo ./target/release/zmq_tun run --mode server
+sudo ./target/release/zmq_tun run --mode server -a tcp://0.0.0.0:5555 --passphrase mysecret
 
 # Client
-sudo ./target/release/zmq_tun run --mode client --address tcp://<server_ip>:5555 --client-ip 10.0.0.2
+sudo ./target/release/zmq_tun run --mode client -a tcp://<server_ip>:5555 --passphrase mysecret --ip 10.0.0.2/24
 ```
-
-### Run (with CURVE encryption)
-
-See [CURVE Encryption](#curve-encryption) for a complete walkthrough.
 
 ---
 
-## CURVE Encryption
+## AES-256 Encryption
 
-ZeroMQ CURVE provides authenticated encryption for all traffic between the server and clients. Every connection is encrypted end-to-end.
+All traffic between server and clients is encrypted with AES-256-CBC. The 32-byte key is derived from a shared passphrase using SHA-256.
 
-### Step 1: Generate server key pair
+### How it works
 
-```bash
-./target/release/zmq_tun keygen -o server.key
-```
+| Component | Detail |
+|-----------|--------|
+| **Cipher** | AES-256-CBC (pure Rust) |
+| **Key derivation** | `SHA-256(passphrase)` |
+| **IV** | 16 random bytes per packet, prepended to ciphertext |
+| **Padding** | PKCS7 |
+| **Wire format** | `[16-byte IV][AES-256-CBC ciphertext]` |
 
-This creates `server.key` with two lines — the public key (first line) and secret key (second line). The public key is shared with clients; the secret key stays on the server.
-
-### Step 2: Generate client key pairs
-
-Each client needs its own key pair:
-
-```bash
-./target/release/zmq_tun keygen -o client1.key
-./target/release/zmq_tun keygen -o client2.key
-```
-
-### Step 3: Start the server
-
-```bash
-sudo ./target/release/zmq_tun run --mode server --enable-curve --curve-key-file server.key
-```
-
-### Step 4: Connect clients
-
-Copy the server's public key (first line of `server.key`) to each client, then start:
-
-```bash
-# Client 1
-sudo ./target/release/zmq_tun run \
-  --mode client \
-  --address tcp://<server_ip>:5555 \
-  --client-ip 10.0.0.2 \
-  --enable-curve \
-  --curve-key-file client1.key \
-  --server-public-key <server-public-key>
-
-# Client 2
-sudo ./target/release/zmq_tun run \
-  --mode client \
-  --address tcp://<server_ip>:5555 \
-  --client-ip 10.0.0.3 \
-  --enable-curve \
-  --curve-key-file client2.key \
-  --server-public-key <server-public-key>
-```
-
-### Key file format
-
-Plain text with exactly two lines:
-
-```
-<Z85 public key>
-<Z85 secret key>
-```
-
-Generate keys without saving to a file (prints to stdout):
-
-```bash
-./target/release/zmq_tun keygen
-```
+Both server and client must use the same passphrase. Encryption is always enabled — `--passphrase` is required.
 
 ### Security notes
 
-- Keep `.key` files secure and never commit them to version control
-- The server's secret key should only exist on the server machine
-- Each client should have its own unique key pair
-- If a key is compromised, generate a new one with `keygen`
-
-### How CURVE works
-
-| Role | What it needs | What it shares |
-|------|---------------|----------------|
-| **Server** | Its own key pair (`server.key`) | Its public key (first line of `server.key`) |
-| **Client** | Its own key pair + server's public key | Nothing — the client key stays local |
-
-The server runs in `ZMQ_CURVE_SERVER` mode and accepts any client that can authenticate against its public key. CURVE handles the handshake automatically; all subsequent traffic is encrypted.
+- SHA-256 of a raw passphrase is not a password-hardened KDF (no salt, no iterations)
+- No authentication (MAC/HMAC) — ciphertext integrity is not verified
+- The IV is random per packet but not authenticated
+- For stronger security later, consider migrating to `argon2`/`pbkdf2` for key derivation and AES-GCM for authenticated encryption
 
 ---
 
@@ -171,17 +108,17 @@ The server runs in `ZMQ_CURVE_SERVER` mode and accepts any client that can authe
 |   |  mpsc ch     |    |    |                      |   |  mpsc ch     |  |
 |   +-------------+     |    |                      |   +-------------+  |
 +-----------------------+    |                      +-------------------+
-                                |
-                 +--------------+--------------+
-                 |  TCP Network (Internet, LAN)|
-                 +-----------------------------+
+                                 |
+                  +--------------+--------------+
+                  |  TCP Network (Internet, LAN)|
+                  +-----------------------------+
 ```
 
 ### Data flow
 
 1. **TUN Reader** — Reads raw IP packets from the TUN device and sends them through a channel to the main loop.
-2. **ZMQ Reader** — Receives messages from the ZeroMQ socket and sends them through a channel to the main loop. On the server, it parses the 3-frame ROUTER envelope to extract sender identity and packet data.
-3. **Main Loop** — Receives from both channels. Client mode sends TUN packets directly to ZMQ. Server mode routes TUN packets by destination IP using the `ClientRegistry`. Packets from ZMQ are written to the local TUN device.
+2. **ZMQ Reader** — Receives messages from the ZeroMQ socket, decrypts them, and sends them through a channel to the main loop. On the server, it parses the 3-frame ROUTER envelope to extract sender identity and packet data.
+3. **Main Loop** — Receives from both channels. Client mode encrypts and sends TUN packets directly to ZMQ. Server mode routes TUN packets by destination IP using the `ClientRegistry`. Packets from ZMQ are written to the local TUN device.
 4. **TUI Task** — Renders a live dashboard with packet statistics and a Wireshark-style packet log.
 
 ---
@@ -193,36 +130,26 @@ The server runs in `ZMQ_CURVE_SERVER` mode and accepts any client that can authe
 | Subcommand | Description |
 |------------|-------------|
 | `run` | Start the tunnel (server or client mode) |
-| `keygen` | Generate a CURVE key pair |
 
 ### `run` arguments
 
 | Argument | Short | Default | Description |
 |----------|-------|---------|-------------|
 | `--mode` | `-m` | *required* | `server` or `client` |
-| `--address` | `-a` | `tcp://0.0.0.0:5555` | ZeroMQ bind/connect address |
+| `--address` | `-a` | *required* | ZeroMQ bind/connect address |
+| `--passphrase` | | *required* | Shared passphrase for AES-256 encryption |
 | `--tun-name` | `-t` | `tun0` | TUN interface name |
 | `--ip` | | `10.0.0.1/24` | IP address and CIDR prefix |
 | `--mtu` | | `1500` | Maximum Transmission Unit |
-| `--client-ip` | | *(none)* | Client IP for routing (required in client mode) |
-| `--enable-curve` | | `false` | Enable ZMQ CURVE encryption |
-| `--curve-key-file` | | *(none)* | Path to Z85-encoded key file (public + secret) |
-| `--server-public-key` | | *(none)* | Server's public key in Z85 (required for client + curve) |
-
-### `keygen` arguments
-
-| Argument | Short | Default | Description |
-|----------|-------|---------|-------------|
-| `--output` | `-o` | *stdout* | Write key pair to file |
 
 ### Logging
 
 ```bash
 # Debug output
-RUST_LOG=debug sudo ./target/release/zmq_tun run --mode server
+RUST_LOG=debug sudo ./target/release/zmq_tun run --mode server -a tcp://0.0.0.0:5555 --passphrase mysecret
 
 # Quiet mode
-RUST_LOG=error sudo ./target/release/zmq_tun run --mode server
+RUST_LOG=error sudo ./target/release/zmq_tun run --mode server -a tcp://0.0.0.0:5555 --passphrase mysecret
 ```
 
 ---
@@ -231,7 +158,7 @@ RUST_LOG=error sudo ./target/release/zmq_tun run --mode server
 
 The built-in TUI provides a live dashboard with:
 
-- **Connection info** — mode, address, uptime, CURVE status
+- **Connection info** — mode, address, uptime, encryption status
 - **Packet counters** — TUN-to-ZMQ and ZMQ-to-TUN packet counts
 - **Connected clients** — number of registered clients (server mode)
 - **Packet log** — Wireshark-style table with source/destination IPs, protocol, length, and status
@@ -242,7 +169,7 @@ Press `Ctrl+Q` or `Ctrl+C` to exit.
 
 - **Yellow** — outbound packets (TUN to ZMQ)
 - **Magenta** — inbound packets (ZMQ to TUN)
-- **Green** — OK status / CURVE enabled
+- **Green** — OK status / encryption enabled
 - **Red** — FAIL status
 
 ---
@@ -251,11 +178,11 @@ Press `Ctrl+Q` or `Ctrl+C` to exit.
 
 ### Client registration
 
-When a client connects, it sends a registration message (prefixed with `0xFE`) containing its IP address. The server's `ClientRegistry` maps the client's ZMQ identity to its IP, enabling return-traffic routing.
+When a client connects, it sends an encrypted registration message (prefixed with `0xFE`) containing its IP address. The server's `ClientRegistry` maps the client's ZMQ identity to its IP, enabling return-traffic routing.
 
 ### Packet routing (server side)
 
-The server extracts the destination IP from each packet arriving from the TUN device and looks up the target client in the registry. Packets are sent using the 3-frame ROUTER envelope: `[identity] [empty delimiter] [data]`.
+The server extracts the destination IP from each packet arriving from the TUN device and looks up the target client in the registry. Packets are encrypted, then sent using the 3-frame ROUTER envelope: `[identity] [empty delimiter] [encrypted data]`.
 
 ### Socket configuration
 
@@ -297,12 +224,12 @@ ss -tlnp | grep 5555
 - Verify the server is running
 - Check firewall rules: `sudo iptables -L -n`
 - Ensure network reachability between hosts
+- Confirm both sides use the same passphrase
 
-### CURVE handshake fails
+### Decryption fails
 
-- Confirm the client's `--server-public-key` matches the server's public key (first line of the server's key file)
-- Confirm both sides use `--enable-curve` — mixing encrypted and unencrypted peers will not work
-- Check that key files have correct permissions and contain valid Z85 keys
+- Confirm both server and client use the exact same passphrase
+- Check for typos — SHA-256 of different passphrases produces completely different keys
 
 ---
 
@@ -335,7 +262,8 @@ docker run --rm -v $(pwd):/usr/src/myapp zmq-tun-builder
 - **Non-root operation** — Linux user namespaces for privilege reduction
 - **Packet compression** — optional compression for low-bandwidth links
 - **Client disconnect detection** — heartbeat or ZMQ monitoring
+- **Authenticated encryption** — migrate to AES-GCM for ciphertext integrity
 
 ---
 
-*Built with Rust, tokio, ZeroMQ, and x25519-dalek.*
+*Built with Rust, tokio, ZeroMQ, and AES-256-CBC.*

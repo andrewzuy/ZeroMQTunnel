@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use log::info;
 use zmq::{Context as ZmqContext, Socket as ZmqSocket, SocketType};
 
-use crate::curve::CurveConfig;
+use crate::encryption::AesConfig;
 
 /// Magic byte prefix for client registration messages.
 pub const REGISTRATION_PREFIX: u8 = 0xFE;
@@ -62,7 +62,7 @@ pub struct ZmqChannel {
     mode: String,
     client_ip: Option<String>,
     client_registry: ClientRegistry,
-    curve_enabled: bool,
+    encryption: Option<AesConfig>,
 }
 
 impl Clone for ZmqChannel {
@@ -72,7 +72,7 @@ impl Clone for ZmqChannel {
             mode: self.mode.clone(),
             client_ip: self.client_ip.clone(),
             client_registry: self.client_registry.clone(),
-            curve_enabled: self.curve_enabled,
+            encryption: self.encryption.clone(),
         }
     }
 }
@@ -83,7 +83,7 @@ impl ZmqChannel {
         mode: &str,
         address: &str,
         client_ip: Option<&str>,
-        curve_config: Option<&CurveConfig>,
+        encryption: Option<AesConfig>,
     ) -> Result<Self> {
         let socket_type = if mode == "server" { SocketType::ROUTER } else { SocketType::DEALER };
         let socket = ctx
@@ -107,10 +107,6 @@ impl ZmqChannel {
             .set_sndtimeo(100)
             .context("failed to set ZMQ_SNDTIMEO")?;
 
-        if let Some(config) = curve_config {
-            apply_curve(&socket, mode, config).context("failed to configure ZMQ CURVE")?;
-        }
-
         if mode == "server" {
             socket.set_immediate(true).context("failed to set ZMQ_IMMEDIATE")?;
             socket
@@ -127,21 +123,29 @@ impl ZmqChannel {
             info!("ZMQ DEALER connected to {}", address);
         }
 
+        if encryption.is_some() {
+            info!("AES-256 encryption enabled ({})", mode);
+        }
+
         let channel = Self {
             socket: Arc::new(std::sync::Mutex::new(socket)),
             mode: mode.to_string(),
             client_ip: client_ip.map(|s| s.to_string()),
             client_registry: ClientRegistry::new(),
-            curve_enabled: curve_config.is_some(),
+            encryption,
         };
 
         if mode == "client" {
             if let Some(ref ip) = channel.client_ip {
-                // Retry registration a few times to ensure connection is ready
                 for attempt in 0..5 {
                     let mut reg_bytes = vec![REGISTRATION_PREFIX];
                     reg_bytes.extend(ip.as_bytes());
-                    let msg = zmq::Message::from(reg_bytes);
+                    let payload = if let Some(ref enc) = channel.encryption {
+                        enc.encrypt(&reg_bytes)
+                    } else {
+                        reg_bytes
+                    };
+                    let msg = zmq::Message::from(payload);
                     match channel.socket.lock().map(|s| s.send(msg, 0)) {
                         Ok(Ok(())) => break,
                         Ok(Err(e)) => {
@@ -172,7 +176,17 @@ impl ZmqChannel {
         &self.mode
     }
 
+    pub fn is_encrypted(&self) -> bool {
+        self.encryption.is_some()
+    }
+
     pub fn send_to_client(&self, identity: &str, data: &[u8]) -> Result<()> {
+        let payload = if let Some(ref enc) = self.encryption {
+            enc.encrypt(data)
+        } else {
+            data.to_vec()
+        };
+
         let sock = self.socket.lock()
             .map_err(|_| anyhow::anyhow!("failed to lock socket"))?;
 
@@ -184,26 +198,42 @@ impl ZmqChannel {
         sock.send(delim_msg, zmq::SNDMORE)
             .context("failed to send delimiter frame")?;
 
-        let data_msg = zmq::Message::from(data.to_vec());
+        let data_msg = zmq::Message::from(payload);
         sock.send(data_msg, 0)
             .context("failed to send data frame")?;
 
         Ok(())
     }
 
-    pub fn recv_with_identity(&self) -> Result<(String, Vec<u8>)> {
+    pub fn send_raw(&self, data: &[u8]) -> Result<()> {
+        let payload = if let Some(ref enc) = self.encryption {
+            enc.encrypt(data)
+        } else {
+            data.to_vec()
+        };
+
         let sock = self.socket.lock()
             .map_err(|_| anyhow::anyhow!("failed to lock socket"))?;
 
-        let id_msg = sock.recv_msg(0)
-            .context("failed to recv identity frame")?;
-        let identity = String::from_utf8_lossy(&*id_msg).to_string();
+        let msg = zmq::Message::from(payload);
+        sock.send(msg, 0)
+            .context("failed to send message")?;
 
-        let data_msg = sock.recv_msg(0)
-            .context("failed to recv data frame")?;
-        let data = (*data_msg).to_vec();
+        Ok(())
+    }
 
-        Ok((identity, data))
+    pub fn decrypt(&self, data: &[u8]) -> Option<Vec<u8>> {
+        if let Some(ref enc) = self.encryption {
+            match enc.decrypt(data) {
+                Ok(decrypted) => Some(decrypted),
+                Err(e) => {
+                    log::error!("Decryption failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            Some(data.to_vec())
+        }
     }
 
     pub fn check_registration(data: &[u8]) -> Option<String> {
@@ -217,25 +247,4 @@ impl ZmqChannel {
         }
         None
     }
-}
-
-fn apply_curve(socket: &ZmqSocket, mode: &str, config: &CurveConfig) -> Result<()> {
-    socket.set_curve_server(true).context("failed to set ZMQ_CURVE_SERVER")?;
-    socket
-        .set_curve_publickey(&config.own_keys.public_key)
-        .context("failed to set ZMQ_CURVE_PUBLICKEY")?;
-    socket
-        .set_curve_secretkey(&config.own_keys.secret_key)
-        .context("failed to set ZMQ_CURVE_SECRETKEY")?;
-
-    if mode != "server" {
-        if let Some(ref server_pk) = config.server_public_key {
-            socket
-                .set_curve_serverkey(server_pk)
-                .context("failed to set ZMQ_CURVE_SERVERKEY")?;
-        }
-    }
-
-    info!("ZMQ CURVE encryption enabled ({})", mode);
-    Ok(())
 }

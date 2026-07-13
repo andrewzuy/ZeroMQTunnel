@@ -16,11 +16,11 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::spawn_blocking;
 use tokio::time::{sleep, Duration};
 
-mod curve;
+mod encryption;
 mod tun;
 mod zmq_comm;
 
-use curve::{CurveConfig, CurveKeys};
+use encryption::AesConfig;
 use tun::TunDevice;
 use zmq_comm::{ClientRegistry, ZmqChannel};
 
@@ -28,14 +28,11 @@ use zmq_comm::{ClientRegistry, ZmqChannel};
 #[command(name = "zmq_tun", about = "TUN-to-ZeroMQ bridge", long_about = "Linux TUN-to-ZeroMQ bridge that forwards IP packets between a TUN interface and a ZeroMQ ROUTER/DEALER socket pair.
 
 Examples:
-  # Generate CURVE keys
-  zmq_tun keygen -o server.key
-
   # Start server
-  sudo zmq_tun run --mode server --enable-curve --curve-key-file server.key
+  sudo zmq_tun run --mode server -a tcp://0.0.0.0:5555 --passphrase mysecret
 
   # Start client
-  sudo zmq_tun run --mode client --enable-curve --server-public-key <server-public-key> --client-ip 10.0.0.2")]
+  sudo zmq_tun run --mode client -a tcp://192.168.1.100:5555 --passphrase mysecret --ip 10.0.0.2/24")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -46,15 +43,9 @@ enum Command {
     /// Run as server or client
     #[command(
         about = "Run as server or client",
-        long_about = "Run the TUN-to-ZeroMQ bridge in server or client mode.\n\nExamples:\n  # Server without encryption\n  sudo zmq_tun run --mode server\n\n  # Server with CURVE encryption\n  sudo zmq_tun run --mode server --enable-curve --curve-key-file server.key\n\n  # Client with CURVE encryption\n  sudo zmq_tun run --mode client --enable-curve --server-public-key <key> --client-ip 10.0.0.2"
+        long_about = "Run the TUN-to-ZeroMQ bridge in server or client mode.\n\nExamples:\n  # Start server\n  sudo zmq_tun run --mode server -a tcp://0.0.0.0:5555 --passphrase mysecret\n\n  # Start client\n  sudo zmq_tun run --mode client -a tcp://192.168.1.100:5555 --passphrase mysecret --ip 10.0.0.2/24"
     )]
     Run(RunArgs),
-    /// Generate a CURVE key pair and print to stdout
-    #[command(
-        about = "Generate a CURVE key pair and print to stdout",
-        long_about = "Generate a CURVE key pair using pure Rust (x25519) and print to stdout.\n\nExamples:\n  # Print to stdout\n  zmq_tun keygen\n\n  # Save to file\n  zmq_tun keygen -o server.key"
-    )]
-    Keygen(KeygenArgs),
 }
 
 #[derive(Parser)]
@@ -63,8 +54,8 @@ struct RunArgs {
     #[arg(short, long, value_enum)]
     mode: Mode,
 
-    /// Listen/connect address
-    #[arg(short, long, default_value = "tcp://0.0.0.0:5555")]
+    /// Listen/connect address (e.g. tcp://0.0.0.0:5555)
+    #[arg(short, long)]
     address: String,
 
     /// TUN interface name
@@ -79,28 +70,9 @@ struct RunArgs {
     #[arg(long, default_value_t = 1500)]
     mtu: u32,
 
-    /// Client IP address (required for client mode, used for routing)
+    /// Passphrase for AES-256 encryption
     #[arg(long)]
-    client_ip: Option<String>,
-
-    /// Enable ZMQ CURVE encryption
-    #[arg(long)]
-    enable_curve: bool,
-
-    /// Path to own CURVE key file (Z85-encoded, two lines: public, secret)
-    #[arg(long)]
-    curve_key_file: Option<String>,
-
-    /// Server's public key in Z85 format (required for client + curve)
-    #[arg(long)]
-    server_public_key: Option<String>,
-}
-
-#[derive(Parser)]
-struct KeygenArgs {
-    /// Output file path (prints to stdout if omitted)
-    #[arg(short, long)]
-    output: Option<String>,
+    passphrase: String,
 }
 
 #[derive(ValueEnum, Clone)]
@@ -291,24 +263,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Command::Keygen(keygen_args) => {
-            run_keygen(keygen_args)?;
-            return Ok(());
-        }
         Command::Run(run_args) => {
             run_tunnel(run_args).await?;
             return Ok(());
         }
     }
-}
-
-fn run_keygen(args: KeygenArgs) -> Result<()> {
-    let keys = CurveKeys::generate().context("failed to generate keys")?;
-    keys.print();
-    if let Some(output) = args.output {
-        keys.save_to_file(&output)?;
-    }
-    Ok(())
 }
 
 async fn run_tunnel(args: RunArgs) -> Result<()> {
@@ -317,32 +276,27 @@ async fn run_tunnel(args: RunArgs) -> Result<()> {
         Mode::Client => "client",
     };
 
-    info!(
-        "Starting zmq_tun: mode={}, address={}, tun={}, ip={}, mtu={}, curve={}",
-        mode_str, args.address, args.tun_name, args.ip, args.mtu, args.enable_curve
-    );
+    let encryption = Some(AesConfig::from_passphrase(&args.passphrase));
+    let encryption_enabled = true;
 
-    let curve_config = if mode_str == "server" {
-        CurveConfig::for_server(args.enable_curve, args.curve_key_file.as_deref())?
-    } else {
-        CurveConfig::for_client(
-            args.enable_curve,
-            args.curve_key_file.as_deref(),
-            args.server_public_key.as_deref(),
-        )?
-    };
+    info!(
+        "Starting zmq_tun: mode={}, address={}, tun={}, ip={}, mtu={}, encryption={}",
+        mode_str, args.address, args.tun_name, args.ip, args.mtu, encryption_enabled
+    );
 
     let (ip, prefix_len) = parse_ip_cidr(&args.ip)?;
 
     let tun = TunDevice::new(&args.tun_name, &ip, prefix_len, args.mtu)?;
+
+    let client_ip = if mode_str == "client" { Some(ip.as_str()) } else { None };
 
     let zmq_ctx = zmq::Context::new();
     let channel = ZmqChannel::new(
         &zmq_ctx,
         mode_str,
         &args.address,
-        args.client_ip.as_deref(),
-        curve_config.as_ref(),
+        client_ip,
+        encryption,
     )?;
     let client_registry = channel.client_registry();
 
@@ -358,9 +312,8 @@ async fn run_tunnel(args: RunArgs) -> Result<()> {
     let mut tui_shutdown = shutdown_tx.subscribe();
     let tui_mode = mode_str.to_string();
     let tui_addr = args.address.clone();
-    let tui_curve = args.enable_curve;
     tokio::spawn(async move {
-        run_tui(tui_state_clone, tui_mode, tui_addr, tui_curve, tui_shutdown_tx, &mut tui_shutdown).await;
+        run_tui(tui_state_clone, tui_mode, tui_addr, encryption_enabled, tui_shutdown_tx, &mut tui_shutdown).await;
     });
 
     let tun_file = tun.file().try_clone()?;
@@ -377,8 +330,9 @@ async fn run_tunnel(args: RunArgs) -> Result<()> {
     let zmq_tui_state = tui_state.clone();
     let zmq_mode = mode_str.to_string();
     let zmq_registry = client_registry.clone();
+    let zmq_channel = channel.clone();
     tokio::spawn(async move {
-        if let Err(e) = zmq_reader_loop(zmq_socket_handle, zmq_shutdown_sub, zmq_tx, zmq_tui_state, &zmq_mode, &zmq_registry).await {
+        if let Err(e) = zmq_reader_loop(zmq_socket_handle, zmq_shutdown_sub, zmq_tx, zmq_tui_state, &zmq_mode, &zmq_registry, &zmq_channel).await {
             error!("ZMQ reader error: {}", e);
         }
         info!("ZMQ reader exited");
@@ -402,7 +356,6 @@ async fn run_tunnel(args: RunArgs) -> Result<()> {
                 let data_clone = data.clone();
 
                 if is_server {
-                    // Route to specific client based on destination IP
                     let dst_ip = extract_dst_ip(&data);
                     let registry = main_registry.clone();
                     let chan = channel.clone();
@@ -426,11 +379,9 @@ async fn run_tunnel(args: RunArgs) -> Result<()> {
 
                     main_tui_state.lock().unwrap().add_entry("tun->zmq", &data_clone, status);
                 } else {
-                    // Client mode: just send
-                    let sock = channel.socket_handle();
+                    let chan = channel.clone();
                     let result = spawn_blocking(move || {
-                        sock.lock().map_err(|e| format!("mutex poisoned: {}", e))
-                            .and_then(|s| s.send(&data, 0).map_err(|e| format!("zmq send error: {}", e)))
+                        chan.send_raw(&data)
                     }).await;
 
                     let status = match result {
@@ -492,7 +443,7 @@ async fn run_tui(
     state: Arc<std::sync::Mutex<TuiState>>,
     mode: String,
     address: String,
-    curve_enabled: bool,
+    encryption_enabled: bool,
     shutdown_tx: broadcast::Sender<()>,
     shutdown: &mut broadcast::Receiver<()>,
 ) {
@@ -510,7 +461,6 @@ async fn run_tui(
     };
 
     loop {
-        // Check for keyboard input (non-blocking)
         if crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
             if let Ok(crossterm::event::Event::Key(key_event)) = crossterm::event::read() {
                 if key_event.kind == crossterm::event::KeyEventKind::Press
@@ -609,11 +559,11 @@ async fn run_tui(
                 Line::from(""),
                 Line::from(Span::styled(
                     format!(
-                        "CURVE encryption: {}",
-                        if curve_enabled { "ENABLED" } else { "DISABLED" }
+                        "AES-256 encryption: {}",
+                        if encryption_enabled { "ENABLED" } else { "DISABLED" }
                     ),
                     Style::new()
-                        .fg(if curve_enabled { Color::Green } else { Color::Yellow })
+                        .fg(if encryption_enabled { Color::Green } else { Color::Yellow })
                         .bold(),
                 )),
                 Line::from(""),
@@ -776,6 +726,7 @@ async fn zmq_reader_loop(
     tui_state: Arc<std::sync::Mutex<TuiState>>,
     mode: &str,
     registry: &ClientRegistry,
+    channel: &ZmqChannel,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -785,13 +736,11 @@ async fn zmq_reader_loop(
                     sock.lock()
                         .map_err(|_e| zmq::Error::EHOSTUNREACH)
                         .and_then(|s| {
-                            // ROUTER framing: [identity] [empty delimiter] [data ...]
                             let id_msg = s.recv_msg(0)?;
                             let identity = String::from_utf8_lossy(&*id_msg).to_string();
 
                             let delim_msg = s.recv_msg(0)?;
                             if !delim_msg.is_empty() {
-                                // No empty delimiter — this is actually the data frame
                                 let data = (*delim_msg).to_vec();
                                 return Ok((identity, data));
                             }
@@ -805,9 +754,14 @@ async fn zmq_reader_loop(
             }) => {
                 match result {
                     Ok(Ok((identity, data))) => {
-                        // Check for client registration
+                        let decrypted = if let Some(dec) = channel.decrypt(&data) {
+                            dec
+                        } else {
+                            continue;
+                        };
+
                         if mode == "server" {
-                            if let Some(client_ip) = ZmqChannel::check_registration(&data) {
+                            if let Some(client_ip) = ZmqChannel::check_registration(&decrypted) {
                                 registry.register(&identity, &client_ip);
                                 let count = registry.len();
                                 info!("{} clients connected", count);
@@ -819,8 +773,8 @@ async fn zmq_reader_loop(
                         }
 
                         let status = "RECV";
-                        tui_state.lock().unwrap().add_entry("zmq_recv", &data, status);
-                        if tx.send(data).await.is_err() {
+                        tui_state.lock().unwrap().add_entry("zmq_recv", &decrypted, status);
+                        if tx.send(decrypted).await.is_err() {
                             break;
                         }
                     }
