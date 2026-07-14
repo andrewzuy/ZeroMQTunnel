@@ -10,7 +10,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use ratatui::Terminal;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::spawn_blocking;
@@ -101,6 +101,7 @@ struct TuiState {
     zmq_connected: bool,
     max_entries: usize,
     client_count: AtomicU64,
+    scroll_offset: usize,
 }
 
 impl TuiState {
@@ -113,6 +114,7 @@ impl TuiState {
             zmq_connected: false,
             max_entries: 500,
             client_count: AtomicU64::new(0),
+            scroll_offset: 0,
         }
     }
 
@@ -461,14 +463,51 @@ async fn run_tui(
     };
 
     loop {
-        if crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
             if let Ok(crossterm::event::Event::Key(key_event)) = crossterm::event::read() {
-                if key_event.kind == crossterm::event::KeyEventKind::Press
-                    && key_event.code == crossterm::event::KeyCode::Char('q')
-                    && key_event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                {
-                    let _ = shutdown_tx.send(());
-                    break;
+                if key_event.kind != crossterm::event::KeyEventKind::Press {
+                    continue;
+                }
+                match key_event.code {
+                    crossterm::event::KeyCode::Char('q')
+                        if key_event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        let _ = shutdown_tx.send(());
+                        break;
+                    }
+                    crossterm::event::KeyCode::Up => {
+                        if let Ok(mut s) = state.lock() {
+                            if s.scroll_offset > 0 {
+                                s.scroll_offset -= 1;
+                            }
+                        }
+                    }
+                    crossterm::event::KeyCode::Down => {
+                        if let Ok(mut s) = state.lock() {
+                            s.scroll_offset += 1;
+                        }
+                    }
+                    crossterm::event::KeyCode::PageUp => {
+                        if let Ok(mut s) = state.lock() {
+                            s.scroll_offset = s.scroll_offset.saturating_sub(10);
+                        }
+                    }
+                    crossterm::event::KeyCode::PageDown => {
+                        if let Ok(mut s) = state.lock() {
+                            s.scroll_offset += 10;
+                        }
+                    }
+                    crossterm::event::KeyCode::Home => {
+                        if let Ok(mut s) = state.lock() {
+                            s.scroll_offset = 0;
+                        }
+                    }
+                    crossterm::event::KeyCode::End => {
+                        if let Ok(mut s) = state.lock() {
+                            s.scroll_offset = u32::MAX as usize;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -477,7 +516,7 @@ async fn run_tui(
             _ = shutdown.recv() => {
                 break;
             }
-            _ = sleep(Duration::from_millis(200)) => {}
+            _ = sleep(Duration::from_millis(50)) => {}
         }
 
         let snapshot = {
@@ -485,10 +524,13 @@ async fn run_tui(
             let entries = s.entries.clone();
             let tun_zmq = s.tun_to_zmq.load(Ordering::Relaxed);
             let zmq_tun = s.zmq_to_tun.load(Ordering::Relaxed);
-            (entries, tun_zmq, zmq_tun)
+            let scroll_offset = s.scroll_offset;
+            (entries, tun_zmq, zmq_tun, scroll_offset)
         };
 
         terminal.draw(|f| {
+            f.render_widget(Clear, f.area());
+
             let size = f.area();
 
             let upper_height = 9;
@@ -504,7 +546,7 @@ async fn run_tui(
             ])
             .split(chunks[0]);
 
-            let (entries, tun_zmq, zmq_tun) = snapshot;
+            let (entries, tun_zmq, zmq_tun, scroll_offset) = snapshot;
 
             let elapsed = state.lock().unwrap().start_time.elapsed();
             let uptime = format_uptime(elapsed);
@@ -568,7 +610,7 @@ async fn run_tui(
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Press Ctrl+Q or Ctrl+C to exit",
+                    "Scroll: \u{2191}\u{2193} PgUp/PgDn Home/End | Ctrl+Q exit",
                     Style::new().fg(Color::Gray),
                 )),
             ];
@@ -585,6 +627,15 @@ async fn run_tui(
                 return;
             }
 
+            let visible_rows = chunks[1].height as usize - 2;
+            let clamped_offset = if scroll_offset >= entries.len() {
+                entries.len().saturating_sub(visible_rows)
+            } else {
+                scroll_offset
+            };
+            let end = (clamped_offset + visible_rows).min(entries.len());
+            let visible_entries = &entries[clamped_offset..end];
+
             let header = vec![
                 "No.",
                 "Time",
@@ -596,7 +647,7 @@ async fn run_tui(
                 "Info",
             ];
 
-            let rows: Vec<Row> = entries.iter().map(|e| {
+            let rows: Vec<Row> = visible_entries.iter().map(|e| {
                 let time_str = format!("{:.3}", e.time_offset);
                 let dir_color = if e.direction == "tun->zmq" {
                     Color::Yellow
@@ -650,7 +701,7 @@ async fn run_tui(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Packet Log (Wireshark-style) ")
+                    .title(format!(" Packet Log [{}/{}]", clamped_offset + 1, entries.len()))
                     .border_style(Style::new().fg(Color::Cyan))
             )
             .column_spacing(1);

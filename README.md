@@ -165,6 +165,19 @@ The built-in TUI provides a live dashboard with:
 
 Press `Ctrl+Q` or `Ctrl+C` to exit.
 
+### Scrolling
+
+The packet log supports scrolling through the buffered entries (up to 500 packets):
+
+| Key | Action |
+|-----|--------|
+| `Up` / `Down` | Scroll one row |
+| `PageUp` / `PageDown` | Scroll 10 rows |
+| `Home` | Jump to the first entry |
+| `End` | Jump to the last entry |
+
+The table title shows the current position (e.g., `[42/500]`). When scrolled to the bottom, new packets auto-scroll into view.
+
 ### Color coding
 
 - **Yellow** — outbound packets (TUN to ZMQ)
