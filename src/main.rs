@@ -10,7 +10,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table};
 use ratatui::Terminal;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::spawn_blocking;
@@ -484,7 +484,9 @@ async fn run_tui(
                     }
                     crossterm::event::KeyCode::Down => {
                         if let Ok(mut s) = state.lock() {
-                            s.scroll_offset += 1;
+                            if s.scroll_offset < s.entries.len().saturating_sub(1) {
+                                s.scroll_offset += 1;
+                            }
                         }
                     }
                     crossterm::event::KeyCode::PageUp => {
@@ -494,7 +496,7 @@ async fn run_tui(
                     }
                     crossterm::event::KeyCode::PageDown => {
                         if let Ok(mut s) = state.lock() {
-                            s.scroll_offset += 10;
+                            s.scroll_offset = (s.scroll_offset + 10).min(s.entries.len().saturating_sub(1));
                         }
                     }
                     crossterm::event::KeyCode::Home => {
@@ -636,6 +638,12 @@ async fn run_tui(
             let end = (clamped_offset + visible_rows).min(entries.len());
             let visible_entries = &entries[clamped_offset..end];
 
+            let inner_chunks = Layout::horizontal([
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(chunks[1]);
+
             let header = vec![
                 "No.",
                 "Time",
@@ -700,13 +708,20 @@ async fn run_tui(
             )
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
                     .title(format!(" Packet Log [{}/{}]", clamped_offset + 1, entries.len()))
                     .border_style(Style::new().fg(Color::Cyan))
             )
             .column_spacing(1);
 
-            f.render_widget(table, chunks[1]);
+            f.render_widget(table, inner_chunks[0]);
+
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓"));
+            let mut scrollbar_state = ScrollbarState::new(entries.len())
+                .position(clamped_offset);
+            f.render_stateful_widget(scrollbar, inner_chunks[1], &mut scrollbar_state);
         }).unwrap();
     }
 
